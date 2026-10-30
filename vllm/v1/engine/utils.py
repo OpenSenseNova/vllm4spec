@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
 logger = init_logger(__name__)
+RAY_PLACEMENT_API_VERSION = 1
 
 STARTUP_POLL_PERIOD_MS = 10000
 
@@ -400,6 +402,36 @@ class CoreEngineActorManager:
         self.local_engine_actors: list[ray.ActorHandle] = []
         self.remote_engine_actors: list[ray.ActorHandle] = []
 
+        parallel_config = vllm_config.parallel_config
+        borrowed_plan = getattr(parallel_config, "ray_placement_plan", None)
+        startup_deadline = None
+        if borrowed_plan is not None:
+            parallel_config.validate_ray_placement()
+            declared = parallel_config.ray_placement_groups
+            assert declared is not None
+            if placement_groups is not None and [
+                p.id.hex() for p in placement_groups
+            ] != [p.id.hex() for p in declared]:
+                raise ValueError("Explicit PGs conflict with bound runtime placement")
+            placement_groups = declared
+            if (
+                local_dp_ranks is not None
+                and local_dp_ranks != parallel_config.ray_placement_local_dp_ranks
+            ):
+                raise ValueError(
+                    "Explicit local DP ranks conflict with bound placement"
+                )
+            local_dp_ranks = parallel_config.ray_placement_local_dp_ranks
+            startup_deadline = time.monotonic() + borrowed_plan["timeout_seconds"]
+
+        def remaining():
+            if startup_deadline is None:
+                return None
+            duration = startup_deadline - time.monotonic()
+            if duration <= 0:
+                raise TimeoutError("Borrowed engine startup deadline expired")
+            return duration
+
         env_vars_list = get_env_vars_to_copy(
             destination=actor_class.__name__,
             exclude_vars=WORKER_SPECIFIC_ENV_VARS,
@@ -407,6 +439,16 @@ class CoreEngineActorManager:
         self.env_vars_dict = {
             name: os.environ[name] for name in env_vars_list if name in os.environ
         }
+        if borrowed_plan is not None and parallel_config.ray_runtime_env:
+            self.env_vars_dict.update(
+                {
+                    name: value
+                    for name, value in parallel_config.ray_runtime_env.get(
+                        "env_vars", {}
+                    ).items()
+                    if name not in WORKER_SPECIFIC_ENV_VARS
+                }
+            )
         runtime_env = RuntimeEnv(env_vars=self.env_vars_dict)
 
         self.addresses = addresses
@@ -456,63 +498,100 @@ class CoreEngineActorManager:
             "Number of placement groups must match data parallel size"
         )
 
-        self.placement_group_is_local = []
-        refs = []
-        for index, local_index, pg in zip(
-            range(dp_size), local_dp_ranks, placement_groups
-        ):
-            dp_vllm_config = copy.deepcopy(vllm_config)
-            if dp_size > 1:
-                _apply_dp_identity_suffix(dp_vllm_config, index)
-            dp_vllm_config.parallel_config.placement_group = pg
-            local_client = index < local_engine_count
+        try:
+            self.placement_group_is_local = []
+            refs = []
+            for index, local_index, pg in zip(
+                range(dp_size), local_dp_ranks, placement_groups
+            ):
+                dp_vllm_config = copy.deepcopy(vllm_config)
+                if dp_size > 1:
+                    _apply_dp_identity_suffix(dp_vllm_config, index)
+                dp_vllm_config.parallel_config.placement_group = pg
+                if borrowed_plan is not None:
+                    dp_plan = dp_vllm_config.parallel_config.ray_placement_plan
+                    assert dp_plan is not None
+                    dp_plan["timeout_seconds"] = remaining()
+                local_client = index < local_engine_count
 
-            # Ray XPU known issue: dpctl initializes the GPU runtime early, so
-            # setting device env vars in Ray actor's initialization method
-            # will not affect device selection. See:
-            # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
-            if current_platform.is_xpu():
-                device_evar = current_platform.device_control_env_var
-                physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
-                    device_evar, local_index, world_size
-                )
-                actor_env_vars = self.env_vars_dict.copy()
-                actor_env_vars[device_evar] = ",".join(str(d) for d in physical_gpu_ids)
-                runtime_env = RuntimeEnv(env_vars=actor_env_vars)
+                # Ray XPU known issue: dpctl initializes the GPU runtime early, so
+                # setting device env vars in Ray actor's initialization method
+                # will not affect device selection. See:
+                # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
+                if current_platform.is_xpu():
+                    device_evar = current_platform.device_control_env_var
+                    physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
+                        device_evar, local_index, world_size
+                    )
+                    actor_env_vars = self.env_vars_dict.copy()
+                    actor_env_vars[device_evar] = ",".join(
+                        str(d) for d in physical_gpu_ids
+                    )
+                    runtime_env = RuntimeEnv(env_vars=actor_env_vars)
 
-            actor = (
-                ray.remote(actor_class)
-                .options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=world_size,
-                    ),
-                    runtime_env=runtime_env,
+                actor = (
+                    ray.remote(actor_class)
+                    .options(
+                        num_cpus=1,
+                        num_gpus=0,
+                        max_restarts=0,
+                        max_task_retries=0,
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=world_size,
+                        ),
+                        runtime_env=runtime_env,
+                    )
+                    .remote(
+                        vllm_config=dp_vllm_config,
+                        executor_class=executor_class,
+                        log_stats=log_stats,
+                        local_client=local_client,
+                        addresses=addresses,
+                        dp_rank=index,
+                        local_dp_rank=local_index,
+                    )
                 )
-                .remote(
-                    vllm_config=dp_vllm_config,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                    local_client=local_client,
-                    addresses=addresses,
-                    dp_rank=index,
-                    local_dp_rank=local_index,
-                )
-            )
-            if local_client:
-                self.local_engine_actors.append(actor)
+                if local_client:
+                    self.local_engine_actors.append(actor)
+                else:
+                    self.remote_engine_actors.append(actor)
+                self.placement_group_is_local.append(local_client)
+                if borrowed_plan is not None:
+                    replica = borrowed_plan["replicas"][index]
+                    parallel_config.ray_placement_event(
+                        "core_created",
+                        {
+                            "actor": actor,
+                            "replica": index,
+                            "node_id": replica["bundle_node_ids"][world_size],
+                            "bundle_index": world_size,
+                            "pg_id": pg.id.hex(),
+                        },
+                        remaining(),
+                    )
+                refs.append(actor.wait_for_init.remote())
+
+            if borrowed_plan is not None:
+                ray.get(refs, timeout=remaining())
             else:
-                self.remote_engine_actors.append(actor)
-            self.placement_group_is_local.append(local_client)
-            refs.append(actor.wait_for_init.remote())
-
-        ray.get(refs)
-        self.run_refs = []
-        self.actor_run_ref_dict = dict()
-        for actor in self.local_engine_actors + self.remote_engine_actors:
-            ref = actor.run.remote()
-            self.run_refs.append(ref)
-            self.actor_run_ref_dict[actor] = ref
+                ray.get(refs)
+            self.run_refs = []
+            self.actor_run_ref_dict = dict()
+            for actor in self.local_engine_actors + self.remote_engine_actors:
+                ref = actor.run.remote()
+                self.run_refs.append(ref)
+                self.actor_run_ref_dict[actor] = ref
+        except BaseException as error:
+            if borrowed_plan is not None:
+                try:
+                    parallel_config.ray_placement_event(
+                        "failed", {"error": repr(error)}, timeout=0.1
+                    )
+                except Exception:
+                    logger.debug("Placement coordinator failure notification failed")
+            self.shutdown()
+            raise
 
     @staticmethod
     def create_dp_placement_groups(
@@ -997,9 +1076,15 @@ class CoreEngineActorManager:
 
         self.manager_stopped.set()
         for actor in self.local_engine_actors + self.remote_engine_actors:
-            ray.kill(actor)
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                logger.exception("Failed to stop engine actor %s", actor)
         for pg in self.created_placement_groups:
-            ray.util.remove_placement_group(pg)
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                logger.exception("Failed to release owned placement group %s", pg)
 
 
 def get_engine_zmq_addresses(
@@ -1115,6 +1200,15 @@ def launch_core_engines(
         )
 
         logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        if getattr(parallel_config, "ray_placement_plan", None) is not None:
+            try:
+                parallel_config.ray_placement_event(
+                    "process_created",
+                    {"role": "dp_coordinator", "pid": coordinator.proc.pid},
+                )
+            except BaseException:
+                coordinator.shutdown(timeout=0)
+                raise
     else:
         coordinator = None
 
@@ -1126,6 +1220,10 @@ def launch_core_engines(
             addresses=addresses,
             executor_class=executor_class,
             log_stats=log_stats,
+            placement_groups=getattr(parallel_config, "ray_placement_groups", None),
+            local_dp_ranks=getattr(
+                parallel_config, "ray_placement_local_dp_ranks", None
+            ),
         )
 
         yield CoreEngineLaunch(

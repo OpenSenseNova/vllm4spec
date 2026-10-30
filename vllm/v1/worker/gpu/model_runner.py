@@ -29,7 +29,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -231,7 +231,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
-        self.use_aux_hidden_state_outputs = False
+        kv_config = vllm_config.kv_transfer_config
+        kv_extra = kv_config.kv_connector_extra_config if kv_config else {}
+        self.target_hidden_state_layer_ids = tuple(
+            (kv_extra or {}).get("target_hidden_state_layer_ids", ())
+        )
+        if self.target_hidden_state_layer_ids and (
+            self.speculative_config is not None or self.use_pp
+        ):
+            raise ValueError(
+                "Target-only hidden-state capture requires no speculative_config "
+                "and pipeline_parallel_size=1."
+            )
+        self.use_aux_hidden_state_outputs = bool(self.target_hidden_state_layer_ids)
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -361,8 +373,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
             if self.use_aux_hidden_state_outputs:
-                assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.target_hidden_state_layer_ids:
+                    self.model.set_aux_hidden_state_layers(
+                        self.target_hidden_state_layer_ids
+                    )
+                else:
+                    assert self.speculative_config is not None
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
@@ -451,11 +470,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
         return speculator.model
 
+    def _aux_hidden_states_for_drafter(
+        self, aux_hidden_states: list[torch.Tensor] | None
+    ) -> list[torch.Tensor] | None:
+        """Drop the Mooncake-only final EAGLE3 auxiliary state.
+
+        SenseSpec asks the target to emit the final pre-norm residual as an
+        additional auxiliary slot so it can be published with the training
+        sequence.  The native EAGLE3 drafter consumes only its configured
+        training slots, so keep the extra row out of the proposer input.
+        """
+        if aux_hidden_states is None or self.speculative_config is None:
+            return aux_hidden_states
+        if self.speculative_config.method != "eagle3":
+            return aux_hidden_states
+
+        expected = None
+        draft_model = self.get_draft_model()
+        if draft_model is not None:
+            expected = getattr(draft_model, "num_aux_layers", None)
+            if expected is None:
+                expected = getattr(draft_model, "num_aux_hidden_states", None)
+            draft_inner = getattr(draft_model, "model", None)
+            if expected is None and draft_inner is not None:
+                expected = getattr(draft_inner, "num_aux_layers", None)
+                if expected is None:
+                    expected = getattr(draft_inner, "num_aux_hidden_states", None)
+        if expected is None and self.speculative_config.draft_model_config is not None:
+            expected = getattr(
+                self.speculative_config.draft_model_config.hf_config,
+                "num_aux_hidden_states",
+                None,
+            )
+        if expected is None:
+            expected = max(len(aux_hidden_states) - 1, 1)
+        expected = int(expected)
+        if len(aux_hidden_states) <= expected:
+            return aux_hidden_states
+        return aux_hidden_states[:expected]
+
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
 
         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
+        # Keep the draft reload implementation shared with the legacy runner
+        # while v2 is still migrating common weight-loading utilities.
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+
+        return GPUModelRunnerV1.reload_draft_weights(self, weights_path)  # type: ignore[arg-type]
 
     def update_config(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
@@ -618,6 +683,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
         )
 
     @torch.inference_mode()
@@ -831,9 +897,125 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             self.pooling_runner.clear()
 
+    def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
+        # SP is not supported yet.
+        return num_scheduled_tokens
+
+    def _init_minimal_kv_cache_for_profiling(self) -> None:
+        """Build a throwaway minimal KV cache so the cudagraph manager's capture
+        descriptors are populated, then the dry-capture in
+        :meth:`profile_cudagraph_memory` can run. Torn down by
+        :meth:`_cleanup_profiling_kv_cache` before the real ``initialize_kv_cache``.
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups,
+            get_kv_cache_groups,
+        )
+
+        kv_cache_spec = self.get_kv_cache_spec()
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        # Smallest KV cache that still lets the largest capture graph run: the
+        # dry-capture reads/writes KV slots via the dummy block tables.
+        min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
+        saved_override = self.cache_config.num_gpu_blocks_override
+        self.cache_config.num_gpu_blocks_override = min_blocks
+        minimal_config = get_kv_cache_config_from_groups(
+            self.vllm_config, kv_cache_groups, available_memory=0
+        )
+        self.cache_config.num_gpu_blocks_override = saved_override
+
+        self.initialize_kv_cache(minimal_config)
+        self.cache_config.num_gpu_blocks = minimal_config.num_blocks
+        logger.debug("Initialized minimal KV cache for CUDA graph profiling")
+
+    def _cleanup_profiling_kv_cache(self) -> None:
+        """Tear down the minimal KV cache / cudagraph manager created for
+        profiling so the real ``initialize_kv_cache`` starts from a clean state.
+        """
+        torch.accelerator.synchronize()
+        if hasattr(self, "kv_caches") and self.kv_caches:
+            for i in range(len(self.kv_caches)):
+                self.kv_caches[i] = None  # type: ignore[assignment]
+            self.kv_caches.clear()
+        if hasattr(self, "attn_groups") and self.attn_groups:
+            self.attn_groups.clear()
+        # Drop the profiling-only manager and block tables (real init recreates).
+        self.cudagraph_manager = None
+        self.block_tables = None  # type: ignore[assignment]
+        if hasattr(self, "kv_cache_config"):
+            delattr(self, "kv_cache_config")
+        self.cache_config.num_gpu_blocks = None
+
+        for layer in self.compilation_config.static_forward_context.values():
+            if hasattr(layer, "kv_cache"):
+                kv_cache = layer.kv_cache
+                layer.kv_cache = (
+                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+                )
+            if hasattr(layer, "impl"):
+                if hasattr(layer.impl, "_k_scale_cache"):
+                    layer.impl._k_scale_cache = None
+                if hasattr(layer.impl, "_v_scale_cache"):
+                    layer.impl._v_scale_cache = None
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        logger.debug("Cleaned up profiling KV cache and CUDA graphs")
+
+    @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        # NOTE(woosuk): It is TBD whether we keep this API or not.
-        return 0
+        """Estimate CUDA graph capture memory so the KV-cache budget reserves
+        room for it. Without this the budget is oversized and capture OOMs at
+        high ``gpu_memory_utilization`` with large ``max_num_seqs``.
+
+        Builds a throwaway minimal KV cache to populate the cudagraph manager's
+        capture descriptors, dry-captures the 2 largest graphs per mode (in
+        ``CudaGraphManager.profile_memory``), and extrapolates. The target
+        model's estimate is included here; speculator (MTP) capture memory is a
+        follow-up.
+        """
+        with set_current_vllm_config(self.vllm_config):
+            self._init_minimal_kv_cache_for_profiling()
+
+        manager = self.cudagraph_manager
+        assert manager is not None
+        if not manager.needs_capture():
+            self._cleanup_profiling_kv_cache()
+            return 0
+
+        saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
+        shared: dict[CUDAGraphMode, int] = {}
+        per_graph: dict[CUDAGraphMode, int] = {}
+        # NOTE: do not toggle set_cudagraph_capturing_enabled here. It defaults
+        # to True and MRv2's capture_model relies on that default (it never
+        # re-enables it); disabling it in this finally would break the real
+        # capture that runs next.
+        try:
+            estimates = manager.profile_memory(
+                self.model,
+                self.model_state,
+                self.input_buffers,
+                self.intermediate_tensors,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                has_lora=self.lora_config is not None,
+                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+            )
+            for mode, (first, rest) in estimates.items():
+                shared[mode] = first
+                per_graph[mode] = rest
+        finally:
+            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            self._cleanup_profiling_kv_cache()
+
+        # FULL and PIECEWISE graphs share the global graph pool at runtime and
+        # are never replayed concurrently, so their shared pool overhead
+        # overlaps (take the max) while per-graph buffers add up (sum).
+        total = max(shared.values(), default=0) + sum(per_graph.values())
+        logger.info("Estimated CUDA graph memory: %.2f GiB total", total / (1 << 30))
+        return int(total)
 
     @torch.inference_mode()
     def capture_model(self) -> int:
@@ -841,7 +1023,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
 
         assert self.cudagraph_manager is not None
-        if not self.cudagraph_manager.needs_capture():
+        capture_encoder = (
+            self.model_state.supports_mm_inputs
+            and self.model_state.encoder_runner.has_cudagraph()
+        )
+        capture_decoder = self.cudagraph_manager.needs_capture()
+        if not capture_encoder and not capture_decoder:
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
@@ -856,27 +1043,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         with self.maybe_setup_dummy_loras(self.lora_config):
-            self.cudagraph_manager.capture(
-                self.model,
-                self.model_state,
-                self.input_buffers,
-                self.intermediate_tensors,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                has_lora=self.lora_config is not None,
-                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-            )
-            if self.speculator is not None:
-                self.speculator.capture()
-            if self.adaptive_verification is not None:
-                with self.step_timing.collect() as timings:
-                    for batch in self.adaptive_verification.batches_to_profile(
-                        self.cudagraph_manager.captured_token_counts()
-                    ):
-                        self._dummy_run(**batch)
-                self.adaptive_verification.set_initial_cost_curves(timings)
+            if capture_encoder:
+                self.model_state.encoder_runner.capture()
+
+            if capture_decoder:
+                self.cudagraph_manager.capture(
+                    self.model,
+                    self.model_state,
+                    self.input_buffers,
+                    self.intermediate_tensors,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    has_lora=self.lora_config is not None,
+                    use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                    lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                )
+                if self.speculator is not None:
+                    self.speculator.capture()
+                if self.adaptive_verification is not None:
+                    with self.step_timing.collect() as timings:
+                        for batch in self.adaptive_verification.batches_to_profile(
+                            self.cudagraph_manager.captured_token_counts()
+                        ):
+                            self._dummy_run(**batch)
+                    self.adaptive_verification.set_initial_cost_curves(timings)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
@@ -1648,6 +1839,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        if self.is_last_pp_rank:
+            method = self.speculative_config.method if self.speculative_config else None
+            if getattr(self, "target_hidden_state_layer_ids", ()) or method in (
+                "eagle",
+                "eagle3",
+                "dspark",
+            ):
+                # Capture only real scheduled rows, excluding CUDA-graph padding.
+                capture_rows = input_batch.num_tokens
+                scheduled_counts = {
+                    req_id: int(
+                        input_batch.query_start_loc_np[index + 1]
+                        - input_batch.query_start_loc_np[index]
+                    )
+                    for index, req_id in enumerate(input_batch.req_ids)
+                }
+                self.kv_connector.capture_hidden_states(
+                    scheduler_output=scheduler_output,
+                    req_ids=list(input_batch.req_ids),
+                    num_scheduled_tokens=scheduled_counts,
+                    target_positions=input_batch.positions[:capture_rows],
+                    aux_hidden_states=(
+                        [state[:capture_rows] for state in aux_hidden_states]
+                        if aux_hidden_states is not None
+                        else None
+                    ),
+                    last_hidden_states=(
+                        hidden_states[:capture_rows]
+                        if hidden_states is not None
+                        else None
+                    ),
+                )
+                # The final pre-norm state is a Mooncake training output, but
+                # native EAGLE3/DSpark draft model expects only its configured
+                # auxiliary training slots.
+                aux_hidden_states = self._aux_hidden_states_for_drafter(
+                    aux_hidden_states
+                )
+
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
             assert slot_mappings is not None
@@ -1884,6 +2114,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
+        if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
+            self.model_state.encoder_runner.clear()
         free_before_shutdown(self.vllm_config)
         if hasattr(self, "model_state"):
             del self.model_state

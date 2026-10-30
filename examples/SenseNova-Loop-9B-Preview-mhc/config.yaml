@@ -1,0 +1,18 @@
+model: /mnt/afs_agents/yankuihao/model_ckpts/SenseNova-6.8-Loop-9B-Preview-mtp13200
+trust-remote-code: true
+tensor-parallel-size: 4
+pipeline-parallel-size: 1
+data-parallel-size: 1
+max-model-len: 131072
+max-num-batched-tokens: 8192
+max-num-seqs: 1
+dtype: bfloat16
+load-format: safetensors
+language-model-only: false
+limit-mm-per-prompt: {image: 4, video: 0}
+mm-processor-kwargs: {max_pixels: 1048576}
+enforce-eager: true
+enable-prefix-caching: false
+enable-chunked-prefill: true
+mamba-ssm-cache-dtype: float32
+generation-config: auto

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+import json
+import math
 import os
 import socket
 from collections.abc import Callable
@@ -31,6 +34,7 @@ else:
     Executor = Any
 
 logger = init_logger(__name__)
+RAY_PLACEMENT_API_VERSION = 1
 _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
@@ -237,8 +241,24 @@ class ParallelConfig:
     ray_runtime_env: RuntimeEnv | None = None
     """Ray runtime environment to pass to distributed workers."""
 
-    placement_group: PlacementGroup | None = None
+    placement_group: PlacementGroup | None = Field(default=None, exclude=True)
     """ray distributed model workers placement group."""
+
+    ray_placement_groups: list[PlacementGroup] | None = Field(
+        default=None, exclude=True
+    )
+    """Caller-owned groups, one per DP engine; never persisted as live handles."""
+
+    ray_placement_local_dp_ranks: list[int] | None = None
+    """Node-local CPU engine identities for the borrowed placement groups."""
+
+    ray_placement_plan: dict[str, Any] | None = None
+    """JSON declarations of borrowed group IDs, bundle nodes and startup timeout."""
+
+    ray_placement_callback: Callable[..., Any] | None = Field(
+        default=None, exclude=True
+    )
+    """Runtime callback for actor ownership, allocation gating and readiness."""
 
     distributed_executor_backend: (
         str | DistributedExecutorBackend | type[Executor] | None
@@ -806,6 +826,10 @@ class ParallelConfig:
             "ray_workers_use_nsight",
             "ray_runtime_env",
             "placement_group",
+            "ray_placement_groups",
+            "ray_placement_local_dp_ranks",
+            "ray_placement_plan",
+            "ray_placement_callback",
             "distributed_executor_backend",
             "worker_cls",
             "sd_worker_cls",
@@ -827,6 +851,141 @@ class ParallelConfig:
 
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
+
+    def bind_ray_placement(
+        self,
+        groups: list[PlacementGroup],
+        local_dp_ranks: list[int],
+        plan: dict[str, Any],
+        callback: Callable[..., Any],
+    ) -> None:
+        """Bind caller-owned Ray groups after engine argument normalization.
+
+        Args:
+            groups: One already-created placement group per DP engine.
+            local_dp_ranks: CPU core indices within each core node.
+            plan: Serializable group, node, bundle and timeout declarations.
+            callback: Bounded runtime ownership and initialization coordinator.
+        """
+        names = (
+            "ray_placement_groups",
+            "ray_placement_local_dp_ranks",
+            "ray_placement_plan",
+            "ray_placement_callback",
+        )
+        previous = [getattr(self, name) for name in names]
+        self.ray_placement_groups = list(groups)
+        self.ray_placement_local_dp_ranks = list(local_dp_ranks)
+        self.ray_placement_plan = copy.deepcopy(plan)
+        self.ray_placement_callback = callback
+        try:
+            self.validate_ray_placement()
+        except BaseException:
+            for name, value in zip(names, previous):
+                setattr(self, name, value)
+            raise
+
+    def validate_ray_placement(self) -> None:
+        """Validate borrowed declarations before creating any engine actor."""
+        groups, ranks, plan = (
+            self.ray_placement_groups,
+            self.ray_placement_local_dp_ranks,
+            self.ray_placement_plan,
+        )
+        if (
+            not self.use_ray
+            or self.data_parallel_backend != "ray"
+            or self.enable_elastic_ep
+        ):
+            raise ValueError("Borrowed placement requires static native Ray execution")
+        if (
+            groups is None
+            or ranks is None
+            or plan is None
+            or len(groups) != self.data_parallel_size
+            or len(ranks) != len(groups)
+            or not callable(self.ray_placement_callback)
+        ):
+            raise ValueError(
+                "Borrowed groups, local ranks, plan and callback must match DP size"
+            )
+        json.dumps(plan, allow_nan=False)
+        timeout = plan.get("timeout_seconds")
+        if (
+            plan.get("version") != 1
+            or not plan.get("run_id")
+            or not plan.get("plan_hash")
+            or not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                "Borrowed placement needs identity and a finite startup timeout"
+            )
+        replicas = plan.get("replicas", [])
+        if len(replicas) != len(groups):
+            raise ValueError("Borrowed replica declarations must match DP size")
+        if envs.VLLM_RAY_DP_PLACEMENT_NODE_IPS:
+            raise ValueError("Borrowed placement conflicts with automatic DP placement")
+        identities: set[str] = set()
+        core_ranks: dict[str, list[int]] = {}
+        for group, local_rank, replica in zip(groups, ranks, replicas):
+            identity = group.id.hex()
+            bundles = group.bundle_specs
+            nodes = replica.get("bundle_node_ids", [])
+            indices = replica.get("worker_bundle_indices", [])
+            if (
+                identity in identities
+                or replica.get("placement_group_id") != identity
+                or len(bundles) != self.world_size + 1
+                or len(nodes) != len(bundles)
+                or any(not isinstance(n, str) or not n for n in nodes)
+                or sorted(indices) != list(range(self.world_size))
+                or replica.get("core_bundle_index") != self.world_size
+            ):
+                raise ValueError(
+                    "Borrowed PG identity, nodes or bundle indices mismatch"
+                )
+            identities.add(identity)
+            if any(bundles[i].get("GPU", 0) != 1 for i in indices):
+                raise ValueError(
+                    "Each borrowed worker bundle must contain exactly one GPU"
+                )
+            core = bundles[self.world_size]
+            if core.get("GPU", 0) != 0 or core.get("CPU", 0) < 1:
+                raise ValueError(
+                    "Borrowed engine core requires its own CPU-only bundle"
+                )
+            if type(local_rank) is not int or local_rank < 0:
+                raise ValueError("Borrowed local DP ranks must be nonnegative integers")
+            core_ranks.setdefault(nodes[-1], []).append(local_rank)
+            if (
+                envs.VLLM_RAY_BUNDLE_INDICES
+                and list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))) != indices
+            ):
+                raise ValueError(
+                    "Borrowed worker indices conflict with the environment"
+                )
+        if any(
+            sorted(values) != list(range(len(values))) for values in core_ranks.values()
+        ):
+            raise ValueError("Borrowed local DP ranks must be contiguous per core node")
+
+    def ray_placement_event(
+        self, event: str, payload: dict[str, Any], timeout: float | None = None
+    ) -> Any:
+        """Call the optional external coordinator without persisting its handle."""
+        if self.ray_placement_plan is None:
+            return None
+        if self.ray_placement_callback is None:
+            raise ValueError("Borrowed placement has no runtime coordinator")
+        duration = (
+            self.ray_placement_plan["timeout_seconds"] if timeout is None else timeout
+        )
+        if not math.isfinite(duration) or duration <= 0:
+            raise TimeoutError("Borrowed placement startup deadline expired")
+        return self.ray_placement_callback(event, payload, timeout=duration)
 
     def __post_init__(self) -> None:
         # Continue with the rest of the initialization

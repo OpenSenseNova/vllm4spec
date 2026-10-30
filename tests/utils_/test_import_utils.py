@@ -4,7 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.import_utils import PlaceholderModule, _has_module
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import PlaceholderModule, _has_module, has_tilelang
 
 
 def _raises_module_not_found():
@@ -101,3 +102,26 @@ class TestHasModule:
             result = _has_module("json")  # should hit cache
             mock_spec.assert_not_called()
             assert result is True
+
+
+class TestHasTilelang:
+    def setup_method(self):
+        has_tilelang.cache_clear()
+
+    def test_availability_check_does_not_import_tilelang(self):
+        with (
+            patch(
+                "vllm.utils.import_utils.importlib.util.find_spec",
+                return_value=MagicMock(),
+            ),
+            patch("vllm.utils.import_utils.importlib.import_module") as mock_import,
+            patch.object(current_platform, "is_rocm", return_value=False),
+        ):
+            assert has_tilelang() is True
+            mock_import.assert_not_called()
+
+    def test_returns_false_when_tilelang_is_not_installed(self):
+        with patch(
+            "vllm.utils.import_utils.importlib.util.find_spec", return_value=None
+        ):
+            assert has_tilelang() is False

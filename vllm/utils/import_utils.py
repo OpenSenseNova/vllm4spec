@@ -505,9 +505,12 @@ def has_triton_kernels() -> bool:
 @cache
 def has_tilelang() -> bool:
     """Whether the optional `tilelang` package is available."""
-    if not _has_module("tilelang"):
+    # Import TileLang only in the worker when its kernels are first used. Besides
+    # initializing CUDA, importing it here loads libcudart_stub.so into the parent
+    # process, where it can interfere with FlashInfer after a fork.
+    if importlib.util.find_spec("tilelang") is None:
         return False
-    # ROCm-only guard, imported lazily to avoid loading rocm on CUDA.
+
     from vllm.platforms import current_platform
 
     if current_platform.is_rocm():

@@ -3,6 +3,7 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -64,6 +65,74 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+@pytest.mark.parametrize(
+    "length,budget,chunked,prefix,error",
+    [
+        (8192, 8192, False, False, None),
+        (262144, 8192, True, False, None),
+        (262145, 8192, True, False, "max_model_len must be <= 262144"),
+        (262144, 8192, False, False, "max_num_batched_tokens must cover"),
+        (262144, 8192, True, True, "prefix caching"),
+    ],
+)
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize("language_model_only", [True, False])
+def test_sensenova_loop_context_and_prefill_limits(
+    monkeypatch, length, budget, chunked, prefix, error, tp_size, language_model_only
+):
+    """Long contexts allow bounded prefill without enabling prefix caching."""
+    import torch
+
+    from vllm.model_executor.models.config import (
+        SenseNovaLoopForConditionalGenerationConfig,
+    )
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=length,
+            dtype=torch.bfloat16,
+            quantization=None,
+            enforce_eager=True,
+            multimodal_config=SimpleNamespace(language_model_only=language_model_only),
+            hf_text_config=SimpleNamespace(
+                model_type="qwen3_5_text",
+                mamba_ssm_dtype="float32",
+                num_hidden_layers=32,
+                layer_types=["linear_attention"] * 3 + ["full_attention"],
+            ),
+            hf_config=SimpleNamespace(
+                loop_settings=dict(start=4, end=28, eval_count=3, use_gate=False),
+                mhc=dict(
+                    start=4, end=28, streams=4, iterations=20, fixed_identity=False
+                ),
+            ),
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            nnodes=1,
+            use_sequence_parallel_moe=False,
+        ),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=prefix, mamba_ssm_cache_dtype="auto"
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=budget, enable_chunked_prefill=chunked
+        ),
+        quant_config=None,
+        lora_config=None,
+        speculative_config=None,
+    )
+    config.model_config.hf_text_config.layer_types *= 8
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        SenseNovaLoopForConditionalGenerationConfig.verify_and_update_config(config)
+    assert config.cache_config.mamba_ssm_cache_dtype == "float32"
 
 
 @pytest.mark.parametrize(

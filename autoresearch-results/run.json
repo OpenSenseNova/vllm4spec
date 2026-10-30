@@ -1,0 +1,30 @@
+{
+  "background": null,
+  "branch": "autoresearch/loop-image-prefill-20261023",
+  "created_at": "2026-10-23T11:12:26Z",
+  "goal": "Reduce real Loop/mHC image-text prefill and complete hidden-state capture latency by at least 20%, preserving BF16, 128K inputs, supervision and four GPUs for training; compare TP=1/2/4 and optimize operators, then integrate retained settings into the TorchSpec example.",
+  "guard": "bash benchmarks/qwen3_5_loop_autoresearch/guard.sh",
+  "max_iterations": null,
+  "metric": {
+    "command": "bash benchmarks/qwen3_5_loop_autoresearch/run.sh",
+    "direction": "lower",
+    "json_key": "time_ratio",
+    "name": "image_text_prefill_capture_time_ratio"
+  },
+  "mode": "foreground",
+  "repo": "/mnt/afs_share/lezewei/TorchSpec/vllm",
+  "run_id": "fa7082cb07304cd7b87db033712f57eb",
+  "schema_version": 1,
+  "scope": [
+    "benchmarks/qwen3_5_loop_autoresearch/tuning.json",
+    "vllm/model_executor/models/config.py",
+    "vllm/model_executor/models/qwen3_5_loop.py",
+    "vllm/model_executor/layers/qwen3_5_mhc.py",
+    "tests/test_config.py",
+    "tests/kernels/test_qwen3_5_mhc.py",
+    "benchmarks/kernels/benchmark_qwen3_5_mhc.py",
+    "benchmarks/kernels/probe_loop_merge.py"
+  ],
+  "target": 0.8,
+  "timeout_seconds": 1800
+}

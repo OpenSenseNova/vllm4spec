@@ -1,0 +1,5 @@
+{
+  "tp_size": 4,
+  "max_num_batched_tokens": 8192,
+  "disable_custom_all_reduce": true
+}

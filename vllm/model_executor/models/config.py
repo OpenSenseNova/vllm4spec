@@ -805,6 +805,97 @@ class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             )
 
 
+class SenseNovaLoopForConditionalGenerationConfig(
+    Qwen3_5ForConditionalGenerationConfig
+):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        import torch
+
+        from vllm import envs
+
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        model = vllm_config.model_config
+        parallel = vllm_config.parallel_config
+        cache = vllm_config.cache_config
+        scheduler = vllm_config.scheduler_config
+        unsupported = []
+        if (
+            parallel.tensor_parallel_size not in (4, 8)
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.nnodes != 1
+        ):
+            unsupported.append("requires single-node TP=4 or TP=8, PP=1, DP=1, CP=1")
+        if parallel.use_sequence_parallel_moe:
+            unsupported.append("sequence parallelism")
+        if model.dtype != torch.bfloat16:
+            unsupported.append("requires dtype=bfloat16")
+        if model.quantization is not None or vllm_config.quant_config is not None:
+            unsupported.append("quantization")
+        if vllm_config.lora_config is not None:
+            unsupported.append("LoRA")
+        if vllm_config.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        if not model.enforce_eager:
+            unsupported.append("requires enforce_eager=True")
+        if not envs.VLLM_USE_V2_MODEL_RUNNER:
+            unsupported.append("requires VLLM_USE_V2_MODEL_RUNNER=1")
+        if cache.enable_prefix_caching:
+            unsupported.append("prefix caching")
+        if cache.mamba_ssm_cache_dtype != "float32":
+            unsupported.append("requires mamba_ssm_cache_dtype=float32")
+        if model.max_model_len > 262144:
+            unsupported.append("max_model_len must be <= 262144")
+        if (
+            not scheduler.enable_chunked_prefill
+            and scheduler.max_num_batched_tokens < model.max_model_len
+        ):
+            unsupported.append("max_num_batched_tokens must cover max_model_len")
+        if unsupported:
+            raise ValueError(
+                "SenseNova Loop unsupported configuration: " + "; ".join(unsupported)
+            )
+
+        text = model.hf_text_config
+        loop = getattr(model.hf_config, "loop_settings", {})
+        mhc = getattr(model.hf_config, "mhc", {})
+        if (
+            text.model_type != "qwen3_5_text"
+            or getattr(text, "layer_scale", False)
+            or loop.get("use_gate", False) is not False
+        ):
+            raise ValueError(
+                "SenseNova Loop requires dense layers without layer_scale or Loop gate"
+            )
+        bounds = [loop.get(key) for key in ("start", "end", "eval_count")]
+        if any(type(value) is not int for value in bounds):
+            raise ValueError("SenseNova Loop bounds and eval_count must be integers")
+        start, end, count = (loop[key] for key in ("start", "end", "eval_count"))
+        if (
+            not 0 <= start < end <= text.num_hidden_layers
+            or count < 1
+            or len(text.layer_types) != text.num_hidden_layers
+        ):
+            raise ValueError(
+                "SenseNova Loop has invalid physical layers or loop_settings"
+            )
+        if (
+            (mhc.get("start"), mhc.get("end")) != tuple(bounds[:2])
+            or mhc.get("streams") not in (2, 4)
+            or mhc.get("iterations") != 20
+            or mhc.get("fixed_identity", True) is not False
+            or mhc.get("pre_scale", 1.0) != 1.0
+        ):
+            raise ValueError(
+                "SenseNova Loop requires mHC over the Loop interval, two or four "
+                "streams, 20 Sinkhorn iterations, fixed_identity=False and "
+                "pre_scale=1.0"
+            )
+
+
 class Qwen3_5ForCausalLMConfig(Qwen3_5ForConditionalGenerationConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -942,6 +1033,9 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForCausalLM": Qwen3_5ForCausalLMConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
+    "SenseNovaLoopForConditionalGeneration": (
+        SenseNovaLoopForConditionalGenerationConfig
+    ),
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,

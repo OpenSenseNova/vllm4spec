@@ -1,0 +1,9 @@
+{
+  "command": "bash benchmarks/qwen3_5_loop_autoresearch/guard.sh",
+  "cwd": "/mnt/afs_share/lezewei/TorchSpec/vllm",
+  "duration_seconds": 51.244361,
+  "returncode": 0,
+  "stderr": "",
+  "stdout": "All real image-text capture guards passed.\n........................................................................ [ 78%]\n....................                                                     [100%]\n=============================== warnings summary ===============================\n../../../../../tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings\n  /tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n92 passed, 189 deselected, 14 warnings in 25.72s\n...................................                                      [100%]\n=============================== warnings summary ===============================\ntests/test_loop_capture.py: 14 warnings\n  /tmp/deepspec_vllm_torchtitan_envs/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n35 passed, 14 warnings in 11.87s\n",
+  "timed_out": false
+}

@@ -44,5 +44,12 @@ def test_device_count_respects_env_after_platform_import():
         )
 
 
+def test_glm5next_model_import_does_not_init_cuda():
+    """Test that importing the GLM-5.3 model does not initialize CUDA."""
+    result = run_script("check_glm5next_no_cuda_init.py")
+    if result.returncode != 0:
+        pytest.fail(f"GLM-5.3 model import initialized CUDA:\n{result.stderr}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

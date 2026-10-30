@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
@@ -242,6 +243,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    compressed_kernel_block_size,
     copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
@@ -1194,6 +1196,7 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=self.compilation_config.static_forward_context,
+            num_blocks=self.kv_cache_config.num_blocks,
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -3974,6 +3977,25 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _all_reqs_past_prompt(self, num_reqs: int) -> bool:
+        """True when every scheduled request has finished its prompt.
+
+        ``num_computed_tokens_cpu`` holds the count from *before* this step, so
+        a request still inside a chunked prefill compares strictly less than its
+        prompt length. Cheap numpy compare over ``num_reqs`` entries; safe for
+        ``num_reqs == 0`` (vacuously true) and on the dummy-run path, where the
+        result is discarded in favour of ``force_uniform_decode``.
+        """
+        if num_reqs <= 0:
+            return True
+        batch = self.input_batch
+        return bool(
+            np.all(
+                batch.num_computed_tokens_cpu[:num_reqs]
+                >= batch.num_prompt_tokens[:num_reqs]
+            )
+        )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3981,15 +4003,28 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
+        all_reqs_past_prompt: bool = True,
     ) -> bool:
         """
         Checks if it's a decode batch with same amount scheduled tokens
         across all requests.
+
+        ``all_reqs_past_prompt`` guards against a *prefill* whose trailing
+        chunk happens to be decode-shaped. With speculative decoding
+        ``uniform_decode_query_len == num_spec + 1``, so a chunked prefill
+        whose remainder is exactly that long satisfies both token-count
+        conditions and would be dispatched to a FULL cudagraph captured for
+        spec-verify. A graph replay does not re-run the Python layer, so the
+        prefill chunk would execute the captured decode kernels against
+        capture-time state -- producing garbage that also leaks the previously
+        served request. Requests still inside their prompt are therefore never
+        eligible for uniform-decode dispatch.
         """
         return (
             (
                 (max_num_scheduled_tokens == uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
+                and all_reqs_past_prompt
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -4068,6 +4103,7 @@ class GPUModelRunner(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
+            all_reqs_past_prompt=self._all_reqs_past_prompt(num_reqs),
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
@@ -5227,6 +5263,14 @@ class GPUModelRunner(
                     "aux_hidden_states are required when using `extract_hidden_states`"
                 )
             target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
+            if getattr(
+                spec_config.draft_model_config.hf_config,
+                "extract_final_hidden_state",
+                False,
+            ):
+                # Reserve the last auxiliary slot for the actual LM-head input;
+                # re-normalizing a rounded residual sum loses fused-norm precision.
+                target_hidden_states[-1] = hidden_states[:num_scheduled_tokens]
 
             draft_token_ids = self.drafter.propose(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
@@ -5303,6 +5347,37 @@ class GPUModelRunner(
                 hidden_states = alt
 
             num_rejected_tokens_gpu = None
+            capture_aux_hidden_states = None
+            capture_last_hidden_states = hidden_states
+            capture_num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+
+            def _aux_states_for_drafter(
+                states: list[torch.Tensor],
+            ) -> list[torch.Tensor]:
+                """Drop the Mooncake-only final pre-norm state for EAGLE3."""
+                if spec_config.method != "eagle3":
+                    return states
+                draft_model = getattr(self.drafter, "model", None)
+                expected = getattr(draft_model, "num_aux_layers", None)
+                if expected is None:
+                    expected = getattr(draft_model, "num_aux_hidden_states", None)
+                if expected is None:
+                    draft_inner = getattr(draft_model, "model", None)
+                    expected = getattr(draft_inner, "num_aux_layers", None)
+                    if expected is None:
+                        expected = getattr(draft_inner, "num_aux_hidden_states", None)
+                if expected is None and spec_config.draft_model_config is not None:
+                    expected = getattr(
+                        spec_config.draft_model_config.hf_config,
+                        "num_aux_hidden_states",
+                        None,
+                    )
+                if expected is None:
+                    expected = max(len(states) - 1, 1)
+                if expected is None or len(states) <= expected:
+                    return states
+                return states[:expected]
+
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
@@ -5310,11 +5385,16 @@ class GPUModelRunner(
                 target_positions = self._get_positions(num_scheduled_tokens)
                 if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
+                    capture_aux_hidden_states = [
+                        h[:num_scheduled_tokens] for h in aux_hidden_states
+                    ]
                     target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                        _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
                     )
+                    capture_last_hidden_states = hidden_states[:num_scheduled_tokens]
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
+                    capture_last_hidden_states = target_hidden_states
             else:
                 if spec_config.disable_padded_drafter_batch:
                     token_indices_to_sample = None
@@ -5327,11 +5407,23 @@ class GPUModelRunner(
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
+                        capture_aux_hidden_states = [
+                            h[token_indices] for h in aux_hidden_states
+                        ]
                         target_hidden_states = torch.cat(
-                            [h[token_indices] for h in aux_hidden_states], dim=-1
+                            _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
                         )
+                        capture_last_hidden_states = hidden_states[token_indices]
                     else:
                         target_hidden_states = hidden_states[token_indices]
+                        capture_last_hidden_states = target_hidden_states
+                    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+                    capture_num_scheduled_tokens = {
+                        req_id: int(
+                            query_start_loc_cpu[index + 1] - query_start_loc_cpu[index]
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
+                    }
                 else:
                     (
                         common_attn_metadata,
@@ -5348,11 +5440,40 @@ class GPUModelRunner(
                     target_positions = self._get_positions(total_num_tokens)
                     if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
+                        capture_aux_hidden_states = [
+                            h[:total_num_tokens] for h in aux_hidden_states
+                        ]
                         target_hidden_states = torch.cat(
-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
+                            _aux_states_for_drafter(capture_aux_hidden_states), dim=-1
                         )
+                        capture_last_hidden_states = hidden_states[:total_num_tokens]
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
+                        capture_last_hidden_states = target_hidden_states
+                    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+                    capture_num_scheduled_tokens = {
+                        req_id: int(
+                            query_start_loc_cpu[index + 1] - query_start_loc_cpu[index]
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
+                    }
+
+            if has_kv_transfer_group() and spec_config.method in (
+                "eagle",
+                "eagle3",
+                "dspark",
+            ):
+                # Native EAGLE/DSpark's proposer is the source of truth for the
+                # verified target rows. The connector stores them by absolute
+                # request position before the draft model starts.
+                get_kv_transfer_group().capture_hidden_states(
+                    scheduler_output=scheduler_output,
+                    req_ids=list(self.input_batch.req_ids),
+                    num_scheduled_tokens=capture_num_scheduled_tokens,
+                    target_positions=target_positions,
+                    aux_hidden_states=capture_aux_hidden_states,
+                    last_hidden_states=capture_last_hidden_states,
+                )
 
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
@@ -5715,6 +5836,77 @@ class GPUModelRunner(
 
         self.reset_encoder_cache()
         self.reset_mm_cache()
+
+    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
+        """Reload native speculative draft weights from a HF checkpoint.
+
+        SenseSpec writes a serving checkpoint on the training side. Loading it
+        through vLLM's own loader keeps sharding and parameter-name mapping
+        identical to the initial EAGLE load and avoids restarting the Ray actor.
+        """
+        draft = self.get_draft_model()
+        if draft is None or self.speculative_config is None:
+            return {"success": True, "message": "no draft model on this worker"}
+
+        draft_config = self.speculative_config.draft_model_config
+        if draft_config is None:
+            return {"success": False, "message": "draft_model_config is missing"}
+        if not Path(weights_path).is_dir():
+            return {
+                "success": False,
+                "message": (
+                    f"Draft weight directory is not accessible on this worker: "
+                    f"{weights_path}. Use a filesystem shared by training and "
+                    "inference nodes."
+                ),
+            }
+        draft_config = copy(draft_config)
+        draft_config.model = weights_path
+        draft_config.revision = None
+        load_config = self.speculative_config.draft_load_config or self.load_config
+        model_loader = get_model_loader(load_config)
+        if not hasattr(model_loader, "get_all_weights"):
+            return {
+                "success": False,
+                "message": (
+                    "draft reload is unsupported for load format "
+                    f"{load_config.load_format}"
+                ),
+            }
+
+        weights_to_load = {name for name, _ in draft.named_parameters()}
+        # Finish checkpoint I/O before replacing any live tensors with Meta tensors.
+        weights = list(model_loader.get_all_weights(draft_config, draft))
+        initialize_layerwise_reload(draft)
+        try:
+            loaded_weights = draft.load_weights(iter(weights))
+        finally:
+            # A failed load is fatal to the training run, but must not leave
+            # shared target/draft parameters or cached buffers on Meta.
+            finalize_layerwise_reload(draft, draft_config)
+            draft_backbone = getattr(draft, "model", None)
+            if draft_backbone is not None and hasattr(
+                draft_backbone, "_build_fused_kv_buffers"
+            ):
+                draft_backbone._build_fused_kv_buffers()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
+        missing = (
+            weights_to_load - loaded_weights if loaded_weights is not None else set()
+        )
+        if missing:
+            logger.warning(
+                "Native EAGLE draft reload left %d parameters unmatched: %s",
+                len(missing),
+                sorted(missing)[:20],
+            )
+        return {
+            "success": True,
+            "message": (
+                f"reloaded {len(loaded_weights or ())} draft parameters "
+                f"from {weights_path}"
+            ),
+        }
 
     def _get_prompt_logprobs_dict(
         self,
@@ -7525,15 +7717,21 @@ class GPUModelRunner(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    num_blocks_per_kv_block = (
-                        kv_cache_spec.block_size // kernel_block_size
-                    )
-                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-
-                    # For MLA with compression, storage_block_size != block_size
+                    # Compressed MLA (storage_block_size != block_size, e.g.
+                    # the indexer kpool / DeepseekV4) is never split into
+                    # attention kernel blocks; it is split into its own pool
+                    # pages when the storage block exceeds one (see
+                    # compressed_kernel_block_size).
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
+                        shape_block_size = compressed_kernel_block_size(kv_cache_spec)
+                        kernel_num_blocks = num_blocks * (
+                            kv_cache_spec.storage_block_size // shape_block_size
+                        )
                     else:
+                        num_blocks_per_kv_block = (
+                            kv_cache_spec.block_size // kernel_block_size
+                        )
+                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
                         shape_block_size = kernel_block_size
 
                     # Skipped layers (--kv-cache-dtype-skip-layers) need
@@ -7560,7 +7758,6 @@ class GPUModelRunner(
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
                     kv_caches[layer_name] = _reshape_attention_kv_cache(
                         raw_tensor,
                         kv_cache_spec,

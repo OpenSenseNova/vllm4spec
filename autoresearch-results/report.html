@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <link rel="icon" href="data:,">
+  <title>Codex Autoresearch Report - Reduce real Loop/mHC image-text prefill and complete hidden-state capture latency by at least 20%, preserving BF16, 128K inputs, supervision and four GPUs for training; compare TP=1/2/4 and optimize operators, then integrate retained settings into the TorchSpec example.</title>
+  <style>
+    :root { color-scheme: light; --ink: #172033; --muted: #647084; --line: #d7dde7; --panel: #f6f8fb; --blue: #2563eb; --green: #15803d; --red: #b42318; --amber: #a15c00; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #ffffff; color: var(--ink); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; line-height: 1.5; letter-spacing: 0; }
+    header { border-bottom: 1px solid var(--line); background: #f9fafc; }
+    .wrap { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+    .header-inner { padding: 34px 0 30px; }
+    .product { margin: 0 0 8px; color: var(--blue); font-size: 13px; font-weight: 700; }
+    h1 { max-width: 900px; margin: 0; font-size: 30px; line-height: 1.2; font-weight: 720; overflow-wrap: anywhere; }
+    .header-meta { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; margin-top: 18px; color: var(--muted); }
+    .status { display: inline-flex; align-items: center; min-height: 28px; padding: 3px 9px; border: 1px solid currentColor; border-radius: 4px; font-weight: 700; }
+    .status.complete { color: var(--green); background: #f0fdf4; } .status.error { color: var(--red); background: #fef3f2; }
+    .status.blocked, .status.stopped { color: var(--amber); background: #fff8e7; } .status.active { color: var(--blue); background: #eff6ff; }
+    main { padding: 28px 0 44px; }
+    section { margin-top: 34px; } section:first-child { margin-top: 0; }
+    h2 { margin: 0 0 14px; font-size: 18px; line-height: 1.3; }
+    .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 0; }
+    .summary-grid > div { min-width: 0; padding: 15px 16px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+    dt { color: var(--muted); font-size: 12px; } dd { margin: 5px 0 0; font-size: 19px; font-weight: 700; overflow-wrap: anywhere; }
+    .chart-shell { border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px 4px; overflow: hidden; background: #fff; }
+    .metric-chart { display: block; width: 100%; height: auto; aspect-ratio: 24 / 7; }
+    .grid-line { stroke: #e7ebf1; stroke-width: 1; } .axis-line { stroke: #8993a4; stroke-width: 1; }
+    .target-line { stroke: #a15c00; stroke-width: 1.5; stroke-dasharray: 6 5; } .target-label { fill: #815000; font-size: 12px; }
+    .retained-line { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+    .retained-point { fill: #fff; stroke: var(--blue); stroke-width: 3; } .trial-point { stroke-width: 2; }
+    .trial-point.keep { fill: #dcfce7; stroke: var(--green); } .trial-point.discard { fill: #fee4e2; stroke: var(--red); }
+    .axis-label, .legend text { fill: var(--muted); font-size: 12px; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+    table { width: 100%; min-width: 1060px; border-collapse: collapse; background: #fff; }
+    th { padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel); color: #485468; font-size: 12px; text-align: left; font-weight: 700; }
+    td { padding: 11px 12px; border-bottom: 1px solid #e8ecf2; vertical-align: top; } tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: #fafcff; } .numeric { text-align: right; font-variant-numeric: tabular-nums; } .retained { font-weight: 700; }
+    .description { min-width: 240px; max-width: 420px; overflow-wrap: anywhere; } .time { white-space: nowrap; color: var(--muted); font-size: 12px; }
+    .event-label { display: inline-block; min-width: 66px; padding: 2px 6px; border-radius: 4px; background: #edf1f6; color: #465268; font-size: 12px; font-weight: 700; text-align: center; }
+    .event-label.keep, .event-label.complete { color: var(--green); background: #e9f8ee; } .event-label.discard, .event-label.error { color: var(--red); background: #fdf0ef; }
+    .event-label.blocked, .event-label.stopped { color: var(--amber); background: #fff4d8; } .event-label.resumed { color: var(--blue); background: #eaf2ff; }
+    code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; overflow-wrap: anywhere; }
+    a { color: #175cd3; text-decoration-thickness: 1px; text-underline-offset: 2px; } .muted { color: #8a94a5; } .commit-separator { margin-left: 5px; color: var(--muted); font-size: 11px; }
+    .config { display: grid; grid-template-columns: 160px minmax(0, 1fr); margin: 0; border-top: 1px solid var(--line); }
+    .config dt, .config dd { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; } .config dd { font-weight: 500; overflow-wrap: anywhere; }
+    footer { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    @media (max-width: 760px) { .wrap { width: min(100% - 24px, 1180px); } .header-inner { padding: 24px 0; } h1 { font-size: 24px; } .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .config { grid-template-columns: 1fr; } .config dt { padding-bottom: 2px; border-bottom: 0; } .config dd { padding-top: 0; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap header-inner">
+      <p class="product">CODEX AUTORESEARCH</p>
+      <h1>Reduce real Loop/mHC image-text prefill and complete hidden-state capture latency by at least 20%, preserving BF16, 128K inputs, supervision and four GPUs for training; compare TP=1/2/4 and optimize operators, then integrate retained settings into the TorchSpec example.</h1>
+      <div class="header-meta">
+        <span class="status complete">complete</span>
+        <span>Run <code>fa7082cb0730</code></span>
+        <span>foreground</span>
+        <span>autoresearch/loop-image-prefill-20261023</span>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section aria-labelledby="summary-heading">
+      <h2 id="summary-heading">Run summary</h2>
+      <dl class="summary-grid">
+        <div><dt>Baseline</dt><dd>1</dd></div>
+        <div><dt>Current</dt><dd>0.7598448218689927</dd></div>
+        <div><dt>Target</dt><dd>0.8</dd></div>
+        <div><dt>Iterations</dt><dd>5</dd></div>
+      </dl>
+    </section>
+    <section aria-labelledby="trajectory-heading">
+      <h2 id="trajectory-heading">Metric trajectory</h2>
+      <div class="chart-shell"><svg class="metric-chart" viewBox="0 0 960 280" role="img" aria-label="Retained and trial metric trajectory">
+  <line class="grid-line" x1="72.00" y1="28.00" x2="936.00" y2="28.00" /><line class="grid-line" x1="72.00" y1="77.00" x2="936.00" y2="77.00" /><line class="grid-line" x1="72.00" y1="126.00" x2="936.00" y2="126.00" /><line class="grid-line" x1="72.00" y1="175.00" x2="936.00" y2="175.00" /><line class="grid-line" x1="72.00" y1="224.00" x2="936.00" y2="224.00" />
+  <line class="axis-line" x1="72.00" y1="224.00" x2="936.00" y2="224.00" />
+  <line class="target-line" x1="72.00" y1="196.89" x2="936.00" y2="196.89" />
+  <polyline class="retained-line" points="72.00,129.21 244.80,129.21 417.60,129.21 590.40,194.96 763.20,194.96 936.00,210.48" />
+  <circle class="trial-point discard" cx="244.80" cy="96.51" r="6"><title>Iteration 1: 1.096620748081378 (discard)</title></circle><circle class="trial-point discard" cx="417.60" cy="41.52" r="6"><title>Iteration 2: 1.2591327651429638 (discard)</title></circle><circle class="trial-point keep" cx="590.40" cy="194.96" r="6"><title>Iteration 3: 0.8057165331567013 (keep)</title></circle><circle class="trial-point discard" cx="763.20" cy="205.17" r="6"><title>Iteration 4: 0.7755502217316629 (discard)</title></circle><circle class="trial-point keep" cx="936.00" cy="210.48" r="6"><title>Iteration 5: 0.7598448218689927 (keep)</title></circle>
+  <circle class="retained-point" cx="72.00" cy="129.21" r="4"><title>Iteration 0: 1 retained</title></circle><circle class="retained-point" cx="244.80" cy="129.21" r="4"><title>Iteration 1: 1 retained</title></circle><circle class="retained-point" cx="417.60" cy="129.21" r="4"><title>Iteration 2: 1 retained</title></circle><circle class="retained-point" cx="590.40" cy="194.96" r="4"><title>Iteration 3: 0.8057165331567013 retained</title></circle><circle class="retained-point" cx="763.20" cy="194.96" r="4"><title>Iteration 4: 0.8057165331567013 retained</title></circle><circle class="retained-point" cx="936.00" cy="210.48" r="4"><title>Iteration 5: 0.7598448218689927 retained</title></circle>
+  <text class="axis-label" x="60.00" y="45.52" text-anchor="end">1.2591327651429638</text>
+  <text class="axis-label" x="60.00" y="214.48" text-anchor="end">0.7598448218689927</text>
+  <text class="target-label" x="80.00" y="188.89">Target 0.8</text>
+  <text class="axis-label" x="72.00" y="250.00">0</text>
+  <text class="axis-label" x="936.00" y="250.00" text-anchor="end">5</text>
+  <g class="legend" transform="translate(650 252)">
+    <line class="retained-line" x1="0" y1="0" x2="24" y2="0" /><text x="32" y="4">Retained</text>
+    <circle class="trial-point keep" cx="122" cy="0" r="5" /><text x="134" y="4">Keep</text>
+    <circle class="trial-point discard" cx="200" cy="0" r="5" /><text x="212" y="4">Discard</text>
+  </g>
+</svg></div>
+    </section>
+    <section aria-labelledby="history-heading">
+      <h2 id="history-heading">Experiment history</h2>
+      <div class="table-wrap" role="region" aria-label="Experiment history table" tabindex="0">
+        <table>
+          <thead><tr><th>Iter</th><th>Event</th><th>Previous</th><th>Trial</th><th>Retained</th><th>Description</th><th>Commits</th><th>Logs</th><th>Time</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="numeric">0</td>
+              <td><span class="event-label baseline">baseline</span></td>
+              <td class="numeric">-</td>
+              <td class="numeric">-</td>
+              <td class="numeric retained">1</td>
+              <td class="description">Initial measurement</td>
+              <td><span class="muted">-</span></td>
+              <td><a href="logs/0000-baseline-verify.json">verify</a> / <a href="logs/0000-baseline-guard.json">guard</a></td>
+              <td class="time">2026-10-23T11:12:26Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">1</td>
+              <td><span class="event-label discard">discard</span></td>
+              <td class="numeric">1</td>
+              <td class="numeric">1.096620748081378</td>
+              <td class="numeric retained">1</td>
+              <td class="description">Test TP=2: fewer ranks may reduce replicated mHC and communication costs</td>
+              <td><code title="57e6dcebc57658a2007909ed338227f58366e0db">57e6dceb</code> <span class="commit-separator">revert</span> <code title="6ea8f138e80b9dbbba90119a8b41d04036296e9c">6ea8f138</code></td>
+              <td><a href="logs/0001-verify.json">verify</a></td>
+              <td class="time">2026-10-23T11:22:13Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">2</td>
+              <td><span class="event-label discard">discard</span></td>
+              <td class="numeric">1</td>
+              <td class="numeric">1.2591327651429638</td>
+              <td class="numeric retained">1</td>
+              <td class="description">Test TP=1: eliminate all-reduce while retaining full BF16 image-text capture</td>
+              <td><code title="58cd8b5157e816b1b51859d230daf0f522a26025">58cd8b51</code> <span class="commit-separator">revert</span> <code title="7306cd99388bdfda3578b1470a5c6931593ecf52">7306cd99</code></td>
+              <td><a href="logs/0002-verify.json">verify</a></td>
+              <td class="time">2026-10-23T11:33:06Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">2</td>
+              <td><span class="event-label blocked">blocked</span></td>
+              <td class="numeric">-</td>
+              <td class="numeric">-</td>
+              <td class="numeric retained">1</td>
+              <td class="description">Fixed TP=4 verification needs GPUs 0-3. GPUs 2-3 remain occupied by other users live vLLM workers (PIDs 2831504 and 2831505, about 74 GB each) across three consecutive goal turns; only GPUs 0-1 are free. Candidate kernel correctness, 127 related tests and lint are complete. End-to-end measurement and target validation require releasing and reserving GPUs 0-3. Candidate preserved in stash 7486aa910d27fcc4b735e4b945d3323a156eca11 and outputs/loop-autoresearch-20261023/pending-candidate with verified source hashes; resume the controller then apply that stash before finish.</td>
+              <td><span class="muted">-</span></td>
+              <td><span class="muted">-</span></td>
+              <td class="time">2026-10-23T12:22:01Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">2</td>
+              <td><span class="event-label resumed">resumed</span></td>
+              <td class="numeric">-</td>
+              <td class="numeric">-</td>
+              <td class="numeric retained">1</td>
+              <td class="description">User authorized stopping the GPU 2-3 qwen38-27b replica; monitor max_instances changed from 3 to 2 with backup, and GPUs 0-3 are now free for the fixed verifier.</td>
+              <td><span class="muted">-</span></td>
+              <td><span class="muted">-</span></td>
+              <td class="time">2026-10-23T13:25:13Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">3</td>
+              <td><span class="event-label keep">keep</span></td>
+              <td class="numeric">1</td>
+              <td class="numeric">0.8057165331567013</td>
+              <td class="numeric retained">0.8057165331567013</td>
+              <td class="description">Fuse four-token block-diagonal BF16 Tensor Core mHC residual merge while preserving every reference rounding boundary and fallback path</td>
+              <td><code title="2528eccd3c02fc830f45c59575cc2352652d7353">2528eccd</code></td>
+              <td><a href="logs/0003-verify.json">verify</a> / <a href="logs/0003-guard.json">guard</a></td>
+              <td class="time">2026-10-23T13:33:52Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">4</td>
+              <td><span class="event-label discard">discard</span></td>
+              <td class="numeric">0.8057165331567013</td>
+              <td class="numeric">0.7755502217316629</td>
+              <td class="numeric retained">0.8057165331567013</td>
+              <td class="description">Increase TP=4 prefill chunk size from 8192 to 16384 tokens to reduce scheduling and per-chunk operator overhead while retaining the Tensor Core merge</td>
+              <td><code title="9f2be9ac4e6f00959cceb34559a7997b3a33e76c">9f2be9ac</code> <span class="commit-separator">revert</span> <code title="989c3561ff070508d4ac42d571a369123a398436">989c3561</code></td>
+              <td><a href="logs/0004-verify.json">verify</a> / <a href="logs/0004-guard.json">guard</a></td>
+              <td class="time">2026-10-23T13:42:13Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">5</td>
+              <td><span class="event-label keep">keep</span></td>
+              <td class="numeric">0.8057165331567013</td>
+              <td class="numeric">0.7598448218689927</td>
+              <td class="numeric retained">0.7598448218689927</td>
+              <td class="description">Tune exact mHC normalization launch geometry and reuse the consumed FP32 square buffer for normalized output</td>
+              <td><code title="e92cadc862730336efa13eb0967e560ae33969d8">e92cadc8</code></td>
+              <td><a href="logs/0005-verify.json">verify</a> / <a href="logs/0005-guard.json">guard</a></td>
+              <td class="time">2026-10-23T13:57:41Z</td>
+            </tr>
+            <tr>
+              <td class="numeric">5</td>
+              <td><span class="event-label complete">complete</span></td>
+              <td class="numeric">-</td>
+              <td class="numeric">-</td>
+              <td class="numeric retained">0.7598448218689927</td>
+              <td class="description">retained metric satisfies the target</td>
+              <td><span class="muted">-</span></td>
+              <td><span class="muted">-</span></td>
+              <td class="time">2026-10-23T13:57:41Z</td>
+            </tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section aria-labelledby="config-heading">
+      <h2 id="config-heading">Configuration</h2>
+      <dl class="config">
+        <dt>Metric</dt><dd>image_text_prefill_capture_time_ratio (lower is better)</dd>
+        <dt>Scope</dt><dd><code>benchmarks/qwen3_5_loop_autoresearch/tuning.json, vllm/model_executor/models/config.py, vllm/model_executor/models/qwen3_5_loop.py, vllm/model_executor/layers/qwen3_5_mhc.py, tests/test_config.py, tests/kernels/test_qwen3_5_mhc.py, benchmarks/kernels/benchmark_qwen3_5_mhc.py, benchmarks/kernels/probe_loop_merge.py</code></dd>
+        <dt>Verify</dt><dd><code>bash benchmarks/qwen3_5_loop_autoresearch/run.sh</code></dd>
+        <dt>Guard</dt><dd><code>bash benchmarks/qwen3_5_loop_autoresearch/guard.sh</code></dd>
+        <dt>Iteration limit</dt><dd>Unlimited</dd>
+      </dl>
+    </section>
+    <footer>Generated 2026-10-23T14:00:00Z from validated <code>run.json</code> and <code>events.jsonl</code>.</footer>
+  </main>
+</body>
+</html>

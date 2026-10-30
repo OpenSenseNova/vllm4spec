@@ -59,6 +59,52 @@ from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
 
+
+@pytest.mark.parametrize("extract_final", [False, True])
+def test_extract_final_hidden_state_preserves_exact_lm_head_input(extract_final):
+    """Opt-in extraction replaces only the last slot, with no second RMSNorm."""
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+
+    final = torch.randn(5, 8, dtype=torch.bfloat16)
+    auxiliary = [torch.randn_like(final) for _ in range(3)]
+    drafter = Mock(spec=ExtractHiddenStatesProposer)
+    drafter.prepare_next_token_ids_padded.return_value = (None, None)
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="extract_hidden_states",
+            use_ngram_gpu=lambda: False,
+            uses_extract_hidden_states=lambda: True,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(extract_final_hidden_state=extract_final)
+            ),
+        ),
+        drafter=drafter,
+        use_aux_hidden_state_outputs=True,
+        requests={},
+        input_batch=None,
+        discard_request_mask=SimpleNamespace(gpu=None),
+        _copy_valid_sampled_token_count=Mock(),
+    )
+    GPUModelRunner.propose_draft_token_ids(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3, num_spec_tokens_to_schedule=1
+        ),
+        sampled_token_ids=torch.zeros(1, 1, dtype=torch.int32),
+        sampling_metadata=None,
+        hidden_states=final,
+        sample_hidden_states=None,
+        aux_hidden_states=auxiliary,
+        spec_decode_metadata=None,
+        common_attn_metadata=None,
+        slot_mappings=None,
+    )
+    captured = drafter.propose.call_args.kwargs["target_hidden_states"]
+    for index in range(3):
+        expected = final if extract_final and index == 2 else auxiliary[index]
+        torch.testing.assert_close(captured[index], expected[:3], rtol=0, atol=0)
+
+
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type

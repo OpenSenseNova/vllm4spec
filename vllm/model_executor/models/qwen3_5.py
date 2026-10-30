@@ -293,6 +293,8 @@ class Qwen3_5ForCausalLMBase(
     SupportsMRoPE,
     SupportsPP,
 ):
+    model_cls: type[nn.Module] = Qwen3_5Model
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -329,7 +331,7 @@ class Qwen3_5ForCausalLMBase(
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = Qwen3_5Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
@@ -460,6 +462,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
+    language_model_cls = Qwen3_5ForCausalLM
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
@@ -502,7 +505,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             )
 
         with self._mark_language_model(vllm_config):
-            self.language_model = Qwen3_5ForCausalLM(
+            self.language_model = self.language_model_cls(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
             )
 
