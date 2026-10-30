@@ -59,3 +59,4 @@ def pytest_generate_tests(metafunc):
             )
         else:
             print("No config files found, test will be skipped")
+            metafunc.parametrize("config_filename", [])

@@ -3,6 +3,7 @@
 import copy
 import os
 import threading
+import time
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ else:
     ActorHandle = None
 
 logger = init_logger(__name__)
+RAY_PLACEMENT_API_VERSION = 1
 
 
 @dataclass
@@ -136,6 +138,28 @@ class RayWorkerProc(WorkerProc):
             for x in physical_gpu_ids
         ]
 
+    def get_placement_report(self) -> dict[str, Any]:
+        """Report a deferred actor's actual placement before device initialization."""
+        from ray._private.worker import get_resource_ids
+
+        node_id, physical_gpu_ids = self.get_node_and_physical_gpu_ids()
+        context = ray.get_runtime_context()
+        group = ray.util.get_current_placement_group()
+        vllm_config = self._init_kwargs["vllm_config"]
+        assert isinstance(vllm_config, VllmConfig)
+        parallel = vllm_config.parallel_config
+        report = {
+            "rank": self._init_kwargs["rank"],
+            "replica": parallel.data_parallel_index,
+            "node_id": node_id,
+            "actor_id": context.get_actor_id(),
+            "pg_id": group.id.hex() if group is not None else None,
+            "physical_gpu_ids": physical_gpu_ids,
+            "resource_ids": get_resource_ids(),
+        }
+        parallel.ray_placement_event("worker_allocated", report)
+        return report
+
     def initialize_worker(
         self,
         local_rank: int,
@@ -168,6 +192,25 @@ class RayWorkerProc(WorkerProc):
             local_rank=local_rank,
             **self._init_kwargs,
         )
+        vllm_config = self._init_kwargs["vllm_config"]
+        assert isinstance(vllm_config, VllmConfig)
+        parallel = vllm_config.parallel_config
+        if parallel.ray_placement_plan is not None:
+            from vllm.distributed.parallel_state import get_dp_group, get_tp_group
+
+            context = ray.get_runtime_context()
+            parallel.ray_placement_event(
+                "worker_initialized",
+                {
+                    "replica": parallel.data_parallel_index,
+                    "rank": self._init_kwargs["rank"],
+                    "tp_rank": get_tp_group().rank_in_group,
+                    "tp_world_size": get_tp_group().world_size,
+                    "distributed_dp_rank": get_dp_group().rank_in_group,
+                    "node_id": context.get_node_id(),
+                    "actor_id": context.get_actor_id(),
+                },
+            )
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
@@ -280,6 +323,37 @@ class RayExecutorV2(MultiprocExecutor):
             return get_open_port()
 
     def _init_executor(self) -> None:
+        plan = self.parallel_config.ray_placement_plan
+        self._placement_deadline = (
+            time.monotonic() + plan["timeout_seconds"] if plan is not None else None
+        )
+        try:
+            self._init_executor_with_placement()
+        except BaseException as error:
+            if plan is not None:
+                try:
+                    self.parallel_config.ray_placement_event(
+                        "failed", {"error": repr(error)}, timeout=0.1
+                    )
+                except Exception:
+                    logger.debug("Placement coordinator failure notification failed")
+            self.shutdown()
+            raise
+
+    def _placement_remaining(self) -> float | None:
+        if self._placement_deadline is None:
+            return None
+        remaining = self._placement_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Borrowed worker initialization deadline expired")
+        return remaining
+
+    def _placement_get(self, refs):
+        if self._placement_deadline is None:
+            return ray.get(refs)
+        return ray.get(refs, timeout=self._placement_remaining())
+
+    def _init_executor_with_placement(self) -> None:
         """Initialize the RayExecutorV2 executor."""
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
@@ -292,6 +366,9 @@ class RayExecutorV2(MultiprocExecutor):
             raise ImportError("Using Ray backend requires installation of ray.")
         initialize_ray_cluster(self.parallel_config, require_gpu_on_driver=False)
         placement_group = self.parallel_config.placement_group
+        if placement_group is None:
+            raise ValueError("Ray executor requires an initialized placement group")
+        placement = self.parallel_config.ray_placement_plan
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -303,7 +380,27 @@ class RayExecutorV2(MultiprocExecutor):
 
         # Step 2: Build bundle assignments for worker rank placement
         # while respecting VLLM_RAY_BUNDLE_INDICES.
-        if envs.VLLM_RAY_BUNDLE_INDICES:
+        if placement is not None:
+            replica = placement["replicas"][self.parallel_config.data_parallel_index]
+            indices = replica["worker_bundle_indices"]
+            if (
+                envs.VLLM_RAY_BUNDLE_INDICES
+                and list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))) != indices
+            ):
+                raise ValueError(
+                    "Runtime bundle indices conflict with borrowed placement"
+                )
+            bundle_to_node_id = get_bundles_for_indices(
+                placement_group, indices, self.world_size
+            )
+            if placement_group.id.hex() != replica["placement_group_id"] or any(
+                node != replica["bundle_node_ids"][index]
+                for index, node, _ in bundle_to_node_id
+            ):
+                raise ValueError(
+                    "Actual PG bundle nodes differ from borrowed placement"
+                )
+        elif envs.VLLM_RAY_BUNDLE_INDICES:
             bundle_to_node_id = get_bundles_for_indices(
                 placement_group,
                 list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))),
@@ -360,6 +457,8 @@ class RayExecutorV2(MultiprocExecutor):
 
         runtime_env = self._build_runtime_env()
         resource_kwargs = self._get_actor_resource_kwargs()
+        if placement is not None and resource_kwargs.get("num_gpus") != 1:
+            raise ValueError("Borrowed placement requires exactly one GPU per worker")
 
         for bundle_idx in range(self.world_size):
             bundle = bundle_assignments[bundle_idx]
@@ -380,6 +479,8 @@ class RayExecutorV2(MultiprocExecutor):
                 .options(
                     name=actor_name,
                     num_cpus=0,
+                    max_restarts=0,
+                    max_task_retries=0,
                     **resource_kwargs,
                     scheduling_strategy=scheduling_strategy,
                     runtime_env=runtime_env,
@@ -402,55 +503,21 @@ class RayExecutorV2(MultiprocExecutor):
                 bundle_id_idx=bundle["bundle_id_idx"],
             )
             self.ray_worker_handles.append(handle)
-
-        # Step 6: Discover physical GPU IDs assigned to each worker via Ray
-        # runtime context.
-        worker_node_and_physical_gpu_ids = ray.get(
-            [
-                h.actor.get_node_and_physical_gpu_ids.remote()
-                for h in self.ray_worker_handles
-            ]
-        )
-
-        node_workers: dict[str, list[int]] = defaultdict(list)
-        node_physical_gpu_ids: dict[str, list[int]] = defaultdict(list)
-        for i, (node_id, physical_gpu_ids) in enumerate(
-            worker_node_and_physical_gpu_ids
-        ):
-            node_workers[node_id].append(i)
-            node_physical_gpu_ids[node_id].extend(physical_gpu_ids)
-        for node_id, physical_gpu_ids in node_physical_gpu_ids.items():
-            node_physical_gpu_ids[node_id] = sorted(physical_gpu_ids)
-
-        # Step 7: Initialize workers with local logical ranks and the
-        # logical-to-physical GPU mapping discovered from Ray placement.
-        init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
-            local_rank = node_workers[node_id].index(i)
-            assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
-            worker_env_vars: dict[str, str] = {}
-            self.ray_worker_handles[i].local_rank = local_rank
-            init_worker_refs.append(
-                self.ray_worker_handles[i].actor.initialize_worker.remote(
-                    local_rank,
-                    worker_env_vars,
-                    self.driver_env_vars,
-                    assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+            if placement is not None:
+                self.parallel_config.ray_placement_event(
+                    "worker_created",
+                    {
+                        "actor": actor,
+                        "replica": self.parallel_config.data_parallel_index,
+                        "rank": handle.rank,
+                        "node_id": handle.node_id,
+                        "bundle_index": handle.bundle_id_idx,
+                        "pg_id": placement_group.id.hex(),
+                    },
+                    self._placement_remaining(),
                 )
-            )
-        # Also set on the executor-side config for consistency. The mapping
-        # is per-node, so only do this when all workers share one node.
-        if len(node_physical_gpu_ids) == 1:
-            node_id_0 = worker_node_and_physical_gpu_ids[0][0]
-            self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
-                node_physical_gpu_ids[node_id_0]
-            )
-        ray.get(init_worker_refs)
 
-        # Step 8: Collect response MQ handles
-        init_results = ray.get(
-            [h.actor.wait_for_init.remote() for h in self.ray_worker_handles]
-        )
+        init_results = self._initialize_workers()
 
         self.response_mqs: list[MessageQueue] = []
         for i, result in enumerate(init_results):
@@ -475,6 +542,86 @@ class RayExecutorV2(MultiprocExecutor):
 
         self.start_worker_monitor()
         self.output_rank = self._get_output_rank()
+
+    def _initialize_workers(self):
+        """Collect placement, wait for all roles, then initialize native workers."""
+        # Step 6: Discover physical GPU IDs assigned to each worker via Ray
+        # runtime context.
+        worker_node_and_physical_gpu_ids = self._placement_get(
+            [
+                h.actor.get_node_and_physical_gpu_ids.remote()
+                for h in self.ray_worker_handles
+            ]
+        )
+
+        placement = self.parallel_config.ray_placement_plan
+        if placement is not None:
+            if len(worker_node_and_physical_gpu_ids) != len(self.ray_worker_handles):
+                raise ValueError("Missing native worker device reports")
+            seen = set()
+            for handle, (node, devices) in zip(
+                self.ray_worker_handles, worker_node_and_physical_gpu_ids
+            ):
+                if (
+                    node != handle.node_id
+                    or len(devices) != 1
+                    or (node, devices[0]) in seen
+                ):
+                    raise ValueError("Native worker node or GPU allocation conflicts")
+                seen.add((node, devices[0]))
+            reports = self._placement_get(
+                [h.actor.get_placement_report.remote() for h in self.ray_worker_handles]
+            )
+            self.parallel_config.ray_placement_event(
+                "allocation_ready",
+                {
+                    "replica": self.parallel_config.data_parallel_index,
+                    "workers": reports,
+                },
+                self._placement_remaining(),
+            )
+
+        node_workers: dict[str, list[int]] = defaultdict(list)
+        node_physical_gpu_ids: dict[str, list[int]] = defaultdict(list)
+        for i, (node_id, physical_gpu_ids) in enumerate(
+            worker_node_and_physical_gpu_ids
+        ):
+            node_workers[node_id].append(i)
+            node_physical_gpu_ids[node_id].extend(physical_gpu_ids)
+        for node_id, physical_gpu_ids in node_physical_gpu_ids.items():
+            node_physical_gpu_ids[node_id] = sorted(physical_gpu_ids)
+
+        # Step 7: Initialize workers with local logical ranks and the
+        # logical-to-physical GPU mapping discovered from Ray placement.
+        init_worker_refs: list[ObjectRef] = []
+        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
+            local_rank = node_workers[node_id].index(i)
+            assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
+            worker_env_vars: dict[str, str] = {}
+            self.ray_worker_handles[i].local_rank = local_rank
+            init_worker_refs.append(
+                self.ray_worker_handles[i].actor.initialize_worker.remote(
+                    local_rank,
+                    worker_env_vars,
+                    self.driver_env_vars,
+                    assigned_physical_gpu_ids=assigned_physical_gpu_ids,
+                )
+            )
+        # Also set on the executor-side config for consistency. The mapping
+        # is per-node, so only do this when all workers share one node.
+        if len(node_physical_gpu_ids) == 1:
+            node_id_0 = worker_node_and_physical_gpu_ids[0][0]
+            self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
+                node_physical_gpu_ids[node_id_0]
+            )
+        self._placement_get(init_worker_refs)
+
+        # Step 8: Collect response MQ handles
+        init_results = self._placement_get(
+            [h.actor.wait_for_init.remote() for h in self.ray_worker_handles]
+        )
+
+        return init_results
 
     def start_worker_monitor(self, inline=False) -> None:
         """Monitor worker liveness via ray.wait() on run() ObjectRefs."""

@@ -375,6 +375,16 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def capture_hidden_states(self, **kwargs: Any) -> None:
+        """Optional hook for connectors that consume target model states.
+
+        Native speculative proposers can expose the exact rows used for draft
+        verification without putting them in a KV-cache group. Existing KV
+        connectors keep the no-op default so this remains backwards compatible.
+        """
+        del kwargs
+        return None
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:

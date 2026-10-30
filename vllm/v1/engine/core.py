@@ -94,6 +94,7 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+RAY_PLACEMENT_API_VERSION = 1
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -2359,6 +2360,27 @@ class EngineCoreActorMixin:
         vllm_config.parallel_config.data_parallel_index = dp_rank
         vllm_config.parallel_config.data_parallel_rank_local = local_dp_rank
 
+        parallel = vllm_config.parallel_config
+        if getattr(parallel, "ray_placement_plan", None) is not None:
+            import ray
+            from ray._private.worker import get_resource_ids
+
+            context = ray.get_runtime_context()
+            group = parallel.placement_group
+            if group is None:
+                raise ValueError("Borrowed engine core requires its placement group")
+            parallel.ray_placement_event(
+                "core_starting",
+                {
+                    "replica": dp_rank,
+                    "actor_id": context.get_actor_id(),
+                    "node_id": context.get_node_id(),
+                    "pg_id": group.id.hex(),
+                    "bundle_index": parallel.world_size,
+                    "resource_ids": get_resource_ids(),
+                },
+            )
+
         self._set_nixl_side_channel_host()
 
         # Set CUDA_VISIBLE_DEVICES as early as possible in actor life cycle
@@ -2393,6 +2415,16 @@ class EngineCoreActorMixin:
     def _set_visible_devices(self, vllm_config: VllmConfig, local_dp_rank: int):
         from vllm.platforms import current_platform
 
+        parallel = vllm_config.parallel_config
+        if (
+            getattr(parallel, "ray_placement_plan", None) is not None
+            and parallel.ray_placement_groups is not None
+            and parallel.use_ray
+            and parallel.data_parallel_backend == "ray"
+        ):
+            # CPU engine identity does not imply a contiguous local GPU range.
+            # Native Ray workers report their actual devices before initialization.
+            return
         if current_platform.is_xpu():
             pass
         else:

@@ -46,6 +46,48 @@ def test_none_overrides_fall_back_to_arch_mapping():
 
 
 @pytest.mark.cpu_test
+def test_qwen_dspark_preserves_its_explicit_architecture():
+    """External DSpark drafts reuse Qwen's text config without becoming MTP."""
+    config = _make_hf_config(
+        architectures=["Qwen3DSparkModel"],
+        model_type="qwen3_5_text",
+        num_hidden_layers=5,
+        mtp_num_hidden_layers=1,
+        target_layer_ids=[1, 16, 31, 46, 61],
+    )
+    original = config.to_dict()
+
+    out = SpeculativeConfig.compose_draft_hf_overrides(None)(config)
+
+    assert out is config
+    assert out.to_dict() == original
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("model_type", "architecture", "expected"),
+    [
+        ("qwen3_5", "Qwen3_5ForConditionalGeneration", "Qwen3_5MTP"),
+        ("qwen3_5_text", "Qwen3_5ForCausalLM", "Qwen3_5MTP"),
+        ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeMTP"),
+        ("qwen3_5_moe_text", "Qwen3_5MoeForCausalLM", "Qwen3_5MoeMTP"),
+    ],
+)
+def test_qwen_mtp_architecture_mapping_is_preserved(model_type, architecture, expected):
+    config = _make_hf_config(
+        architectures=[architecture],
+        model_type=model_type,
+        mtp_num_hidden_layers=1,
+    )
+
+    out = SpeculativeConfig.compose_draft_hf_overrides(None)(config)
+
+    assert out.model_type == "qwen3_5_mtp"
+    assert out.architectures == [expected]
+    assert out.n_predict == 1
+
+
+@pytest.mark.cpu_test
 def test_callable_overrides_reach_the_draft_config():
     """A callable override (config-to-config transform) composes with the
     architecture-mapping override and is applied to the draft config."""

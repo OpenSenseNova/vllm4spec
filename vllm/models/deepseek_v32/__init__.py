@@ -4,8 +4,7 @@
 
 DeepSeek V3.2 introduced the DeepSeek Sparse Attention (DSA) architecture:
 MLA + a "lightning indexer" that selects the top-k tokens for a sparse MLA
-attend. The same model code serves any DSA checkpoint, including GLM-5.2
-(``glm_moe_dsa``), which reuses this architecture.
+attend.
 """
 
 from vllm.platforms import current_platform

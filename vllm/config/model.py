@@ -308,7 +308,7 @@ class ModelConfig:
     """Override the model class used for one or more architectures, mapping the
     architecture name to a `"module:class"` target (the same format accepted by
     `ModelRegistry.register_model`). This registers the target class at runtime,
-    e.g. `{"GlmMoeDsaForCausalLM":
+    e.g. `{"DeepseekV3ForCausalLM":
     "vllm.models.deepseek_v32.nvidia.model:DeepseekV32ForCausalLM"}`. This
     argument is for development and debugging purposes only."""
     generation_config: str = "auto"

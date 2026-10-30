@@ -36,11 +36,6 @@ _DEFAULT_DOTPROD_BS = 128
 _DEFAULT_DOTPROD_MAX_M = 4
 _DEFAULT_SPLITK_CONFIG = (6, 4)
 
-# ll_bf16 router shapes covered by warmup/tuning:
-# (4096, 256)  # DSV4-Flash
-# (6144, 256)  # GLM5.2
-# (7168, 256)  # DSV3.2
-# (7168, 384)  # DSV4-Pro
 
 # SM100f-specific tuned configs
 _SM100F_TUNED_DOTPROD_BS: dict[tuple[int, int], dict[int, int]] = {

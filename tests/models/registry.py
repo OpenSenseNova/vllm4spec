@@ -294,9 +294,6 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "zai-org/GLM-4.7-Flash",
         min_transformers_version="5.0.0",
     ),
-    "GlmMoeDsaForCausalLM": _HfExamplesInfo(
-        "zai-org/GLM-5", min_transformers_version="5.0.1", is_available_online=False
-    ),
     "GPT2LMHeadModel": _HfExamplesInfo("openai-community/gpt2"),
     "GPTBigCodeForCausalLM": _HfExamplesInfo(
         "bigcode/starcoder",
@@ -1383,6 +1380,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         hf_overrides={"architectures": ["Qwen3ASRForcedAlignerForTokenClassification"]},
     ),
     "RForConditionalGeneration": _HfExamplesInfo("YannQi/R-4B", trust_remote_code=True),
+    "SenseNovaLoopForConditionalGeneration": _HfExamplesInfo(
+        "/mnt/afs_agents/yankuihao/model_ckpts/SenseNova-6.8-Loop-9B-Preview-mtp13200",
+        max_model_len=8192,
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "SkyworkR1VChatModel": _HfExamplesInfo(
         "Skywork/Skywork-R1V-38B",
         trust_remote_code=True,

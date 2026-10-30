@@ -394,6 +394,73 @@ def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(
     assert torch.equal(builder.scheduler_metadata[:3], expected)
 
 
+def test_fa3_draft_metadata_uses_draft_attention_dimensions(monkeypatch):
+    """Qwen's 256-dim target must not size a 128-dim EAGLE draft's schedule."""
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.vllm_flash_attn import (
+        flash_attn_varlen_func,
+        is_fa_version_supported,
+    )
+
+    if not torch.cuda.is_available() or not is_fa_version_supported(3):
+        pytest.skip("requires FlashAttention 3 on Hopper")
+    monkeypatch.setattr(flash_attn_module, "get_flash_attn_version", lambda: 3)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda _: 6,
+            get_num_kv_heads=lambda _: 1,
+            get_head_size=lambda: 256,
+            rswa_window=None,
+            is_mm_prefix_lm=False,
+        ),
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            max_cudagraph_capture_size=0,
+            static_forward_context={
+                "draft.attn": Mock(spec=Attention, impl=SimpleNamespace(num_heads=10))
+            },
+        ),
+        attention_config=SimpleNamespace(),
+    )
+    cache_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+    )
+    builder = flash_attn_module.FlashAttentionMetadataBuilder(
+        cache_spec, ["draft.attn"], config, torch.device("cuda")
+    )
+    builder.aot_sliding_window = (-1, -1)
+    query_starts = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([8], dtype=torch.int32, device="cuda")
+    metadata = builder._get_scheduler_metadata(
+        aot_schedule=True,
+        batch_size=1,
+        cu_query_lens=query_starts,
+        max_query_len=1,
+        seqlens=seq_lens,
+        max_seq_len=8,
+        causal=True,
+        max_num_splits=0,
+    )
+    kwargs = dict(
+        q=torch.randn(1, 10, 128, dtype=torch.bfloat16, device="cuda"),
+        k=torch.randn(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda"),
+        v=torch.randn(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda"),
+        max_seqlen_q=1,
+        max_seqlen_k=8,
+        cu_seqlens_q=query_starts,
+        seqused_k=seq_lens,
+        block_table=torch.tensor([[0]], dtype=torch.int32, device="cuda"),
+        causal=True,
+        fa_version=3,
+    )
+    actual = flash_attn_varlen_func(**kwargs, scheduler_metadata=metadata)
+    expected = flash_attn_varlen_func(**kwargs, scheduler_metadata=None)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypatch):
     builder = object.__new__(flash_attn_module.FlashAttentionMetadataBuilder)
     builder.aot_schedule = True

@@ -2256,6 +2256,55 @@ def test_hidden_state_group_preserves_hybrid_prefix_cache_granularity():
     ) == (544, 136)
 
 
+def test_separate_hidden_state_pages_admit_qwen_128k_without_padding_waste():
+    """Qwen TP4 extraction must fit 128K without one verifier page per token."""
+    config = _grouping_config()
+    config.model_config = SimpleNamespace(max_model_len=131073)
+    config.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+    )
+    config.cache_config = SimpleNamespace(
+        num_gpu_blocks_override=None, mamba_cache_mode="none"
+    )
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector_extra_config={"separate_hidden_state_pages": True}
+    )
+    attention = FullAttentionSpec(
+        block_size=800, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+    )
+    mamba = MambaSpec(block_size=1, shapes=((409600,),), dtypes=(torch.bfloat16,))
+    hidden = HiddenStateCacheSpec(
+        block_size=800, num_kv_heads=6, head_size=5120, dtype=torch.bfloat16
+    )
+    specs = {f"attn.{i}": attention for i in range(16)}
+    specs.update({f"mamba.{i}": mamba for i in range(48)})
+    specs["cache_only_layers.64"] = hidden
+    groups = get_kv_cache_groups(config, specs)
+    assert groups[-1].kv_cache_spec == hidden
+    required = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    assert required < 32 * GiB_bytes
+    cache = kv_cache_utils.get_kv_cache_config_from_groups(config, groups, required)
+    assert get_max_concurrency_for_kv_cache_config(config, cache) == 1
+    assert sum(tensor.size for tensor in cache.kv_cache_tensors) == required
+    assert all(tensor.block_stride == 0 for tensor in cache.kv_cache_tensors)
+    hidden_tensor = next(
+        tensor
+        for tensor in cache.kv_cache_tensors
+        if tensor.shared_by == ["cache_only_layers.64"]
+    )
+    assert hidden_tensor.size == hidden.page_size_bytes * cache.num_blocks
+
+    config.kv_transfer_config = None
+    default_groups = get_kv_cache_groups(config, specs)
+    assert default_groups[-1].kv_cache_spec.block_size == 1
+    assert (
+        kv_cache_utils._max_memory_usage_bytes_from_groups(config, default_groups)
+        > 1000 * GiB_bytes
+    )
+
+
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
     specs = {
         "target.0.attn": new_mla_spec(),

@@ -29,6 +29,17 @@ except ImportError as e:
     FA3_AVAILABLE = False
 
 
+_FA3_DEFAULT_KWARGS = (
+    {"only_qv": False}
+    if FA3_AVAILABLE
+    and any(
+        argument.name == "only_qv"
+        for argument in torch.ops._vllm_fa3_C.fwd.default._schema.arguments
+    )
+    else {}
+)
+
+
 try:
     import os
 
@@ -379,11 +390,12 @@ def flash_attn_varlen_func(
             scheduler_metadata,
             num_splits,
             None,  # pack_gqa
-            0,  # sm_margin
-            s_aux,  # s_aux
-            cp_world_size,
-            cp_rank,
-            cp_tot_seqused_k,
+            sm_margin=0,
+            s_aux=s_aux,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
+            **_FA3_DEFAULT_KWARGS,
         )
     elif fa_version == 4:
         assert alibi_slopes is None, "Alibi is not supported in FA4"
@@ -466,7 +478,7 @@ def compile_flash_attn_varlen_func_from_specs(
         raise NotImplementedError("FA4 compile-only wrapper does not support dropout")
     del deterministic
 
-    from vllm.vllm_flash_attn.cute.interface import (
+    from vllm.vllm_flash_attn.cute.interface import (  # type: ignore[attr-defined]
         compile_flash_attn_varlen_func_from_specs as _fa4_compile_flash_attn_varlen_func_from_specs,
     )
 

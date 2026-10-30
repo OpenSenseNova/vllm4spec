@@ -457,6 +457,10 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def reload_draft_weights(self, weights_path: str) -> dict[str, Any]:
+        with set_current_vllm_config(self.vllm_config):
+            return self.model_runner.reload_draft_weights(weights_path)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

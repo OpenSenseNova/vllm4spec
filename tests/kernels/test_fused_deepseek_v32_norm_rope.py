@@ -33,7 +33,7 @@ from vllm.platforms import current_platform
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
-# GLM-5.2 / DeepSeek-V3.2 shapes (TP8 local heads).
+# DeepSeek-V3.2 shapes (TP8 local heads).
 Q_LORA = 2048
 KV_LORA = 512
 ROPE_DIM = 64
@@ -83,7 +83,7 @@ def rope(
     """Apply RoPE to the first ``rot_dim`` elements of x's last dim.
 
     x: [..., head_dim] fp32. ``cos_sin`` is [max_pos, rot_dim]. ``interleave``
-    selects adjacent-pair (GLM) vs split-half NeoX (DeepSeek-V3.2) layout.
+    selects adjacent-pair vs split-half NeoX (DeepSeek-V3.2) layout.
     """
     rot = cos_sin.shape[-1]
     half = rot // 2

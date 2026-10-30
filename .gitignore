@@ -31,6 +31,22 @@ __pycache__/
 
 # C extensions
 *.so
+*.o
+*.obj
+*.a
+
+# CMake / Ninja build intermediates
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+_deps/
+
+# GPU compilation caches
+.nv/
+.torch_extensions/
 
 # Rust binaries
 vllm/vllm-rs
@@ -56,6 +72,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.whl
 MANIFEST
 /.deps/
 
@@ -233,6 +250,13 @@ hip_compat.h
 # Benchmark dataset
 benchmarks/**/*.json
 
+# Local verification reports
+/examples/**/verification*.json
+/examples/**/*-verification.json
+
+# GitHub repository configuration
+/.github/
+
 # Linting
 actionlint
 shellcheck*/
@@ -254,3 +278,12 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+autoresearch-results/
+benchmarks/
+examples/qwen3.5-loop-mhc/
+tests/config/test_sensenova_loop_config.py
+tests/cuda/scripts/
+tests/kernels/test_kpool_decode_update_batched.py
+tests/models/glm5next
+tests/cuda/scripts/check_glm5next_no_cuda_init.py
+tests/config/test_speculative_draft_hf_overrides.py

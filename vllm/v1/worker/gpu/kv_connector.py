@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
 
+    def capture_hidden_states(self, **kwargs) -> None:
+        """Receive target hidden states for non-cache speculative connectors."""
+        pass
+
     def pre_forward(self, scheduler_output: "SchedulerOutput") -> None:
         pass
 
@@ -73,6 +77,11 @@ class ActiveKVConnector(KVConnector):
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+
+    def capture_hidden_states(self, **kwargs) -> None:
+        if self._disabled:
+            return
+        self.kv_connector.capture_hidden_states(**kwargs)
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True

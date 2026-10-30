@@ -34,6 +34,67 @@ SOFT_CAPS = [None]
 SLIDING_WINDOWS = [None, 256]
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("has_only_qv", [False, True])
+def test_fa3_default_call_preserves_kernel_arguments(monkeypatch, has_only_qv):
+    from vllm.vllm_flash_attn import flash_attn_interface
+
+    query = torch.empty((1, 2, 64))
+    cumulative_lengths = torch.tensor([0, 1], dtype=torch.int32)
+    output = torch.empty_like(query)
+    softmax_lse = torch.empty((2, 1))
+    extra_kwargs = {"only_qv": False} if has_only_qv else {}
+
+    def forward(
+        *args,
+        sm_margin,
+        s_aux,
+        cp_world_size,
+        cp_rank,
+        cp_tot_seqused_k,
+        **kwargs,
+    ):
+        assert len(args) == 32
+        assert args[0] is query
+        assert sm_margin == 0
+        assert s_aux is None
+        assert cp_world_size == 1
+        assert cp_rank == 0
+        assert cp_tot_seqused_k is None
+        assert kwargs == extra_kwargs
+        return output, softmax_lse, None, None
+
+    monkeypatch.setattr(flash_attn_interface, "_FA3_DEFAULT_KWARGS", extra_kwargs)
+    monkeypatch.setattr(torch.ops._vllm_fa3_C, "fwd", forward, raising=False)
+    actual, actual_lse = flash_attn_interface.flash_attn_varlen_func(
+        query,
+        query,
+        query,
+        max_seqlen_q=1,
+        cu_seqlens_q=cumulative_lengths,
+        max_seqlen_k=1,
+        cu_seqlens_k=cumulative_lengths,
+        fa_version=3,
+        return_softmax_lse=True,
+    )
+    assert actual is output
+    assert actual_lse is softmax_lse
+
+
+@pytest.mark.cpu_test
+def test_fa3_defaults_match_installed_kernel_schema():
+    from vllm.vllm_flash_attn import flash_attn_interface
+
+    if not flash_attn_interface.FA3_AVAILABLE:
+        pytest.skip("FA3 extension is not installed")
+    argument_names = {
+        argument.name
+        for argument in torch.ops._vllm_fa3_C.fwd.default._schema.arguments
+    }
+    expected = {"only_qv": False} if "only_qv" in argument_names else {}
+    assert expected == flash_attn_interface._FA3_DEFAULT_KWARGS
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,

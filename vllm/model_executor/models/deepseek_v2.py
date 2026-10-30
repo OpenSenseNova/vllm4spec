@@ -124,10 +124,6 @@ def _get_moe_router_dtype(
     config: DeepseekV2Config | DeepseekV3Config,
 ) -> torch.dtype | None:
     router_dtype = getattr(config, "moe_router_dtype", None)
-    if getattr(config, "model_type", None) == "glm_moe_dsa":
-        # Older GLM-5/5.2 configs require fp32 routing but do not expose
-        # moe_router_dtype yet.
-        return torch.float32
     if router_dtype == "float32":
         return torch.float32
     return None
@@ -1925,8 +1921,4 @@ class DeepseekForCausalLM(DeepseekV2ForCausalLM):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    pass
-
-
-class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     pass

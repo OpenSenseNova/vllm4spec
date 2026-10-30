@@ -359,7 +359,6 @@ class SpeculativeConfig:
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",
-            "glm_moe_dsa",
         ):
             hf_config.model_type = "deepseek_mtp"
         if hf_config.model_type == "deepseek_mtp":
@@ -548,12 +547,12 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]}
             )
-        if hf_config.model_type in (
-            "qwen3_5",
-            "qwen3_5_moe",
-            "qwen3_5_text",
-            "qwen3_5_moe_text",
+        if (
+            hf_config.model_type
+            in ("qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text")
+            and initial_architecture != "Qwen3DSparkModel"
         ):
+            # External DSpark drafts reuse Qwen's config but keep their own model.
             # Checkpoints that ship only the text config resolve to the
             # `qwen3_5_text` / `qwen3_5_moe_text` model types and carry the
             # same `mtp_num_hidden_layers` field as the multimodal ones.
@@ -880,6 +879,16 @@ class SpeculativeConfig:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
 
+            # SenseSpec's native EAGLE path passes a small ``draft_model_config``
+            # dictionary to pin auxiliary target-layer IDs. Preserve those
+            # fields while constructing the real ModelConfig below. Upstream
+            # vLLM normally replaces this field entirely from ``model``.
+            draft_hf_config_overrides: dict[str, Any] = {}
+            if isinstance(self.draft_model_config, dict):
+                raw_hf_config = self.draft_model_config.get("hf_config", {})
+                if isinstance(raw_hf_config, dict):
+                    draft_hf_config_overrides = dict(raw_hf_config)
+
             if self.model is not None:
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
@@ -920,6 +929,8 @@ class SpeculativeConfig:
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
+                for key, value in draft_hf_config_overrides.items():
+                    setattr(self.draft_model_config.hf_config, key, value)
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
@@ -1005,6 +1016,8 @@ class SpeculativeConfig:
                             model_type="eagle",
                         )
                         self.draft_model_config.hf_config = eagle_config
+                        for key, value in draft_hf_config_overrides.items():
+                            setattr(self.draft_model_config.hf_config, key, value)
                         self.update_arch_()
 
                 if self.method == "dspark" and (

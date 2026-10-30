@@ -303,10 +303,6 @@ def _fused_norm_rope_kernel(
         rstd = tl.rsqrt(var + index_k_layer_norm_eps)
         normed = (index_k - mean) * rstd * index_k_w + index_k_b
 
-        # 2. RoPE on the rotation region. Supports both interleaved (adjacent
-        #    pairs, e.g. GLM-5.2) and NeoX (split-half, e.g. DeepSeek-V3.2). The
-        #    rotation partner is gathered from the read-only inputs and
-        #    re-normalized with the same (mean, rstd) — no scratch, no atomics.
         pos = tl.load(pos_ptr + tok_idx)
         in_rope = index_k_block < 2 * INDEX_K_HALF_ROT_DIM
         if INDEX_ROPE_INTERLEAVE:
@@ -708,8 +704,6 @@ def _fused_q_kernel(
         iq_base = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
         index_q = tl.load(iq_base + index_q_block).to(tl.float32)
 
-        # RoPE in registers (interleaved for GLM-5.2, NeoX for DeepSeek-V3.2),
-        # gathering the rotation partner from the read-only input.
         in_rope = index_q_block < 2 * INDEX_Q_HALF_ROT_DIM
         if INDEX_ROPE_INTERLEAVE:
             cos_idx = index_q_block // 2

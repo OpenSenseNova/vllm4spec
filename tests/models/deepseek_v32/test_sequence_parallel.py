@@ -115,7 +115,6 @@ def test_mtp_projects_sequence_shard_and_restores_full_output(monkeypatch):
     layer.enorm = _IdentityNorm()
     layer.hnorm = _IdentityNorm()
     layer.eh_proj = _RecordingProjection()
-    layer._eh_plan = None
     object.__setattr__(layer, "mtp_block", _SequenceParallelMTPBlock())
     norm = Mock(
         side_effect=lambda hidden_states, residual: (hidden_states + residual, None)
@@ -129,7 +128,6 @@ def test_mtp_projects_sequence_shard_and_restores_full_output(monkeypatch):
             [inputs_embeds, previous_hidden_states], dim=-1
         ),
     )
-    monkeypatch.setattr(deepseek_v32_mtp, "run_glm52_plan", lambda *args: None)
     _mock_sequence_parallel_collectives(monkeypatch, deepseek_v32_mtp)
 
     inputs_embeds = torch.arange(6, dtype=torch.float32).view(3, 2)

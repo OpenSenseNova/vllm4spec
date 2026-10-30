@@ -228,9 +228,6 @@ class TestBackendValidation:
             from vllm.v1.attention.backends.mla.prefill.flashinfer import (
                 FlashInferPrefillBackend,
             )
-            from vllm.v1.attention.backends.mla.prefill.trtllm_ragged import (
-                TrtllmRaggedPrefillBackend,
-            )
         except ImportError:
             pytest.skip("MLA prefill backend not available")
             return
@@ -268,24 +265,6 @@ class TestBackendValidation:
             )
             assert len(invalid_reasons) == 1
             assert "supported MLA dimensions" in invalid_reasons[0]
-
-        selector_config_glm5 = MLAPrefillSelectorConfig(
-            dtype=torch.bfloat16,
-            mla_dimensions=MLADimensions(
-                qk_nope_head_dim=192,
-                qk_rope_head_dim=64,
-                v_head_dim=256,
-            ),
-        )
-
-        with patch.object(
-            TrtllmRaggedPrefillBackend, "is_available", return_value=True
-        ):
-            invalid_reasons = TrtllmRaggedPrefillBackend.validate_configuration(
-                capability,
-                selector_config_glm5,
-            )
-            assert invalid_reasons == []
 
 
 @pytest.mark.skipif(
